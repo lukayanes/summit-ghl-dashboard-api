@@ -1,0 +1,7 @@
+name = "summit-ghl-dashboard-api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+# Non-sensitive variables can go here
+# Sensitive values (API keys) should be added as secrets via Cloudflare dashboard
