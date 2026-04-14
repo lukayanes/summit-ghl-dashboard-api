@@ -189,10 +189,11 @@ async function computePipelineStats(env) {
         };
       }
 
-      // Initialize stage if needed
-      if (!stats.pipelines[pipelineId].stages[opp.stageId]) {
-        stats.pipelines[pipelineId].stages[opp.stageId] = {
-          id: opp.stageId,
+      // Initialize stage if needed — use stageInfo.stageId (the matched ID from pipeline definition)
+      const resolvedStageId = stageInfo.stageId;
+      if (!stats.pipelines[pipelineId].stages[resolvedStageId]) {
+        stats.pipelines[pipelineId].stages[resolvedStageId] = {
+          id: resolvedStageId,
           name: stageInfo.stageName,
           count: 0,
           totalValue: 0,
@@ -202,7 +203,7 @@ async function computePipelineStats(env) {
         };
       }
 
-      const stage = stats.pipelines[pipelineId].stages[opp.stageId];
+      const stage = stats.pipelines[pipelineId].stages[resolvedStageId];
       const value = parseFloat(opp.monetaryValue) || 0;
       const createdAt = new Date(opp.createdAt);
       const daysInStage = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24));
