@@ -154,6 +154,8 @@ async function computePipelineStats(env) {
     });
 
     // Initialize stats structure
+    let unmatchedCount = 0;
+    const unmatchedStageIds = new Set();
     const stats = {
       pipelines: {},
       summary: {
@@ -166,10 +168,11 @@ async function computePipelineStats(env) {
 
     // Aggregate opportunities by pipeline and stage
     opportunities.forEach(opp => {
-      const stageInfo = stageMap.get(opp.stageId);
+      const stageInfo = stageMap.get(opp.pipelineStageId) || stageMap.get(opp.stageId);
 
       if (!stageInfo) {
-        console.warn(`Unknown stage: ${opp.stageId}`);
+        unmatchedCount++;
+        unmatchedStageIds.add(opp.pipelineStageId || opp.stageId || 'none');
         return;
       }
 
@@ -231,6 +234,22 @@ async function computePipelineStats(env) {
     stats.summary.averageValue = opportunities.length > 0
       ? stats.summary.totalValue / opportunities.length
       : 0;
+    stats.debug = {
+      pipelineCount: pipelines.length,
+      stageCount: stageMap.size,
+      opportunityCount: opportunities.length,
+      unmatchedCount,
+      unmatchedStageIds: [...unmatchedStageIds].slice(0, 10),
+      sampleOppKeys: opportunities.length > 0 ? Object.keys(opportunities[0]) : [],
+      sampleOpp: opportunities.length > 0 ? {
+        id: opportunities[0].id,
+        stageId: opportunities[0].stageId,
+        pipelineStageId: opportunities[0].pipelineStageId,
+        pipelineId: opportunities[0].pipelineId,
+        status: opportunities[0].status,
+      } : null,
+      stageIds: [...stageMap.keys()].slice(0, 10),
+    };
 
     return stats;
   } catch (error) {
@@ -314,6 +333,27 @@ export default {
       if (pathname === '/api/pipeline-stats') {
         const stats = await computePipelineStats(env);
         return jsonResponse(stats);
+      }
+
+      if (pathname === '/api/debug') {
+        const [pipelinesData, opportunitiesData] = await Promise.all([
+          fetchPipelines(env),
+          fetchAllOpportunities(env),
+        ]);
+        const pipelines = pipelinesData.pipelines || [];
+        const opps = opportunitiesData.opportunities || [];
+        return jsonResponse({
+          pipelineCount: pipelines.length,
+          pipelines: pipelines.map(p => ({
+            id: p.id,
+            name: p.name,
+            stageCount: (p.stages || []).length,
+            stages: (p.stages || []).map(s => ({ id: s.id, name: s.name })),
+          })),
+          opportunityCount: opps.length,
+          sampleOpportunity: opps.length > 0 ? opps[0] : null,
+          opportunityKeys: opps.length > 0 ? Object.keys(opps[0]) : [],
+        });
       }
 
       if (pathname === '/health') {
