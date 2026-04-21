@@ -286,18 +286,29 @@ async function computeLeadSourceStats(env) {
       const createdAt = new Date(opp.createdAt || opp.dateAdded || Date.now());
       const monthKey = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}`;
 
-      // Extract tags — GHL stores them as an array of strings on the opportunity
-      const tags = (opp.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
+      // Extract tags from the CONTACT object nested inside the opportunity
+      const contactTags = (opp.contact?.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
+      // Also check opportunity-level tags as fallback
+      const oppTags = (opp.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
+      const allTagsForOpp = [...contactTags, ...oppTags];
 
       // Track all tags for debugging
-      tags.forEach(t => { if (t) allTags[t] = (allTags[t] || 0) + 1; });
+      allTagsForOpp.forEach(t => { if (t) allTags[t] = (allTags[t] || 0) + 1; });
 
-      // Bucket by tag: "facebook lead" → facebook, "sm3" → google, else → other
+      // Also check opportunity source field as secondary signal
+      const oppSource = (opp.source || '').toLowerCase();
+
+      // Bucket by tag: "facebook lead" → facebook, "sm3" → google
+      // Fallback: source field containing "ppc" or "google" → google, "facebook"/"fb" → facebook
       let bucket = 'other';
-      if (tags.some(t => t === 'facebook lead' || t.includes('facebook lead'))) {
+      if (allTagsForOpp.some(t => t === 'facebook lead' || t.includes('facebook lead'))) {
         bucket = 'facebook';
-      } else if (tags.some(t => t === 'sm3' || t.includes('sm3'))) {
+      } else if (allTagsForOpp.some(t => t === 'sm3' || t.includes('sm3'))) {
         bucket = 'google';
+      } else if (oppSource.includes('ppc') || oppSource.includes('google')) {
+        bucket = 'google';
+      } else if (oppSource.includes('facebook') || oppSource.includes('fb') || oppSource.includes('meta')) {
+        bucket = 'facebook';
       }
 
       // Count as lead
@@ -343,12 +354,11 @@ async function computeLeadSourceStats(env) {
     const sampleOpps = opportunities.slice(0, 5).map(opp => ({
       id: opp.id,
       name: opp.name,
-      tags: opp.tags,
-      labels: opp.labels,
       source: opp.source,
-      leadSource: opp.leadSource,
-      utm_source: opp.utm_source,
-      customFields: opp.customField ? Object.keys(opp.customField).slice(0, 5) : undefined,
+      oppTags: opp.tags,
+      contactTags: opp.contact?.tags,
+      contactSource: opp.contact?.source,
+      contactKeys: opp.contact ? Object.keys(opp.contact) : undefined,
     }));
 
     // Also check which top-level keys contain arrays or tag-like data
