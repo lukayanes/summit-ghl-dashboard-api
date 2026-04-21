@@ -262,44 +262,56 @@ async function computePipelineStats(env) {
 /**
  * Compute lead source analytics (Google vs Facebook vs other)
  *
- * Lead source is determined by GHL TAGS on the opportunity/contact:
+ * Lead source is determined by GHL TAGS on the contact:
  *   - "facebook lead" tag  →  Facebook bucket
  *   - "sm3" tag            →  Google bucket
  *   - Neither              →  Other bucket
+ *
+ * Contract detection is NOT done here — the frontend cross-references
+ * contact names against the Deal Ledger (source of truth for contracts).
+ * This endpoint returns every lead's name and source bucket so the
+ * frontend can do the matching.
+ *
+ * Supports optional ?months=N query param to limit to last N months.
  */
-async function computeLeadSourceStats(env) {
+async function computeLeadSourceStats(env, monthsBack) {
   try {
     const opportunitiesData = await fetchAllOpportunities(env);
     const opportunities = opportunitiesData.opportunities || [];
 
+    // Date filter: only include leads from the last N months
+    const cutoffDate = monthsBack
+      ? new Date(Date.now() - monthsBack * 30.44 * 24 * 60 * 60 * 1000)
+      : null;
+
     const sourceBuckets = {
-      google: { leads: 0, contracts: 0, byMonth: {} },
-      facebook: { leads: 0, contracts: 0, byMonth: {} },
-      other: { leads: 0, contracts: 0, byMonth: {} },
-      combined: { leads: 0, contracts: 0, byMonth: {} },
+      google: { leads: [], byMonth: {} },
+      facebook: { leads: [], byMonth: {} },
+      other: { leads: [], byMonth: {} },
+      combined: { leads: [], byMonth: {} },
     };
 
-    // Track all unique tags for debugging
     const allTags = {};
 
     opportunities.forEach(opp => {
       const createdAt = new Date(opp.createdAt || opp.dateAdded || Date.now());
+
+      // Apply date filter
+      if (cutoffDate && createdAt < cutoffDate) return;
+
       const monthKey = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}`;
 
       // Extract tags from the CONTACT object nested inside the opportunity
       const contactTags = (opp.contact?.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
-      // Also check opportunity-level tags as fallback
       const oppTags = (opp.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
       const allTagsForOpp = [...contactTags, ...oppTags];
 
-      // Track all tags for debugging
       allTagsForOpp.forEach(t => { if (t) allTags[t] = (allTags[t] || 0) + 1; });
 
-      // Also check opportunity source field as secondary signal
+      // Also check opportunity source field as fallback
       const oppSource = (opp.source || '').toLowerCase();
 
-      // Bucket by tag: "facebook lead" → facebook, "sm3" → google
-      // Fallback: source field containing "ppc" or "google" → google, "facebook"/"fb" → facebook
+      // Bucket by tag first, then by source field
       let bucket = 'other';
       if (allTagsForOpp.some(t => t === 'facebook lead' || t.includes('facebook lead'))) {
         bucket = 'facebook';
@@ -311,73 +323,54 @@ async function computeLeadSourceStats(env) {
         bucket = 'facebook';
       }
 
-      // Count as lead
-      sourceBuckets[bucket].leads++;
-      sourceBuckets.combined.leads++;
+      // Build lead record with contact name for frontend cross-referencing
+      const contactName = (opp.contact?.name || opp.name || '').trim();
+      const contactEmail = (opp.contact?.email || '').trim();
+      const contactPhone = (opp.contact?.phone || '').trim();
 
-      // Initialize month if needed
+      const leadRecord = {
+        name: contactName,
+        email: contactEmail,
+        phone: contactPhone,
+        createdAt: opp.createdAt,
+        month: monthKey,
+        source: bucket,
+        oppSource: opp.source || null,
+        tags: allTagsForOpp.filter(t => t),
+      };
+
+      sourceBuckets[bucket].leads.push(leadRecord);
+      sourceBuckets.combined.leads.push(leadRecord);
+
+      // Monthly lead counts
       if (!sourceBuckets[bucket].byMonth[monthKey]) {
-        sourceBuckets[bucket].byMonth[monthKey] = { leads: 0, contracts: 0 };
+        sourceBuckets[bucket].byMonth[monthKey] = { leads: 0 };
       }
       if (!sourceBuckets.combined.byMonth[monthKey]) {
-        sourceBuckets.combined.byMonth[monthKey] = { leads: 0, contracts: 0 };
+        sourceBuckets.combined.byMonth[monthKey] = { leads: 0 };
       }
       sourceBuckets[bucket].byMonth[monthKey].leads++;
       sourceBuckets.combined.byMonth[monthKey].leads++;
-
-      // Check if this opportunity became a contract (has status indicating progression)
-      const status = (opp.status || '').toLowerCase();
-      const isContract = status.includes('won') || status.includes('contract')
-        || status.includes('listed') || status.includes('sold')
-        || status.includes('closed') || status.includes('under contract');
-      if (isContract) {
-        sourceBuckets[bucket].contracts++;
-        sourceBuckets.combined.contracts++;
-        sourceBuckets[bucket].byMonth[monthKey].contracts++;
-        sourceBuckets.combined.byMonth[monthKey].contracts++;
-      }
     });
 
-    // Calculate leads-per-contract ratios
+    // Build result — include lead names for cross-referencing but keep payload reasonable
     const result = {};
     for (const [key, data] of Object.entries(sourceBuckets)) {
       result[key] = {
-        leads: data.leads,
-        contracts: data.contracts,
-        leadsPerContract: data.contracts > 0 ? Math.round(data.leads / data.contracts * 10) / 10 : null,
-        conversionRate: data.leads > 0 ? Math.round(data.contracts / data.leads * 1000) / 10 : 0,
+        leadCount: data.leads.length,
         byMonth: data.byMonth,
+        // Include all lead names/emails for cross-referencing against Deal Ledger
+        leadNames: data.leads.map(l => l.name).filter(n => n),
+        leadDetails: key !== 'other' ? data.leads : [], // Full details for google/facebook only (other is too large)
       };
     }
-
-    // Debug: sample a few opportunities to show what tag-related fields exist
-    const sampleOpps = opportunities.slice(0, 5).map(opp => ({
-      id: opp.id,
-      name: opp.name,
-      source: opp.source,
-      oppTags: opp.tags,
-      contactTags: opp.contact?.tags,
-      contactSource: opp.contact?.source,
-      contactKeys: opp.contact ? Object.keys(opp.contact) : undefined,
-    }));
-
-    // Also check which top-level keys contain arrays or tag-like data
-    const tagRelatedKeys = opportunities.length > 0
-      ? Object.keys(opportunities[0]).filter(k => {
-          const val = opportunities[0][k];
-          return Array.isArray(val) || (typeof val === 'string' && (k.toLowerCase().includes('tag') || k.toLowerCase().includes('label') || k.toLowerCase().includes('source')));
-        })
-      : [];
 
     return {
       sources: result,
       totalOpportunities: opportunities.length,
+      filteredCount: sourceBuckets.combined.leads.length,
+      monthsBack: monthsBack || 'all',
       uniqueTags: allTags,
-      debug: {
-        sampleOpportunities: sampleOpps,
-        tagRelatedKeys,
-        allKeysOnFirstOpp: opportunities.length > 0 ? Object.keys(opportunities[0]) : [],
-      },
       generatedAt: new Date().toISOString(),
     };
   } catch (error) {
@@ -464,7 +457,9 @@ export default {
       }
 
       if (pathname === '/api/lead-sources') {
-        const stats = await computeLeadSourceStats(env);
+        const monthsParam = url.searchParams.get('months');
+        const monthsBack = monthsParam ? parseInt(monthsParam) : null;
+        const stats = await computeLeadSourceStats(env, monthsBack);
         return jsonResponse(stats);
       }
 
