@@ -339,10 +339,35 @@ async function computeLeadSourceStats(env) {
       };
     }
 
+    // Debug: sample a few opportunities to show what tag-related fields exist
+    const sampleOpps = opportunities.slice(0, 5).map(opp => ({
+      id: opp.id,
+      name: opp.name,
+      tags: opp.tags,
+      labels: opp.labels,
+      source: opp.source,
+      leadSource: opp.leadSource,
+      utm_source: opp.utm_source,
+      customFields: opp.customField ? Object.keys(opp.customField).slice(0, 5) : undefined,
+    }));
+
+    // Also check which top-level keys contain arrays or tag-like data
+    const tagRelatedKeys = opportunities.length > 0
+      ? Object.keys(opportunities[0]).filter(k => {
+          const val = opportunities[0][k];
+          return Array.isArray(val) || (typeof val === 'string' && (k.toLowerCase().includes('tag') || k.toLowerCase().includes('label') || k.toLowerCase().includes('source')));
+        })
+      : [];
+
     return {
       sources: result,
       totalOpportunities: opportunities.length,
       uniqueTags: allTags,
+      debug: {
+        sampleOpportunities: sampleOpps,
+        tagRelatedKeys,
+        allKeysOnFirstOpp: opportunities.length > 0 ? Object.keys(opportunities[0]) : [],
+      },
       generatedAt: new Date().toISOString(),
     };
   } catch (error) {
