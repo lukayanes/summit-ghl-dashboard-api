@@ -260,6 +260,98 @@ async function computePipelineStats(env) {
 }
 
 /**
+ * Compute lead source analytics (Google vs Facebook vs other)
+ *
+ * Lead source is determined by GHL TAGS on the opportunity/contact:
+ *   - "facebook lead" tag  →  Facebook bucket
+ *   - "sm3" tag            →  Google bucket
+ *   - Neither              →  Other bucket
+ */
+async function computeLeadSourceStats(env) {
+  try {
+    const opportunitiesData = await fetchAllOpportunities(env);
+    const opportunities = opportunitiesData.opportunities || [];
+
+    const sourceBuckets = {
+      google: { leads: 0, contracts: 0, byMonth: {} },
+      facebook: { leads: 0, contracts: 0, byMonth: {} },
+      other: { leads: 0, contracts: 0, byMonth: {} },
+      combined: { leads: 0, contracts: 0, byMonth: {} },
+    };
+
+    // Track all unique tags for debugging
+    const allTags = {};
+
+    opportunities.forEach(opp => {
+      const createdAt = new Date(opp.createdAt || opp.dateAdded || Date.now());
+      const monthKey = `${createdAt.getFullYear()}-${String(createdAt.getMonth() + 1).padStart(2, '0')}`;
+
+      // Extract tags — GHL stores them as an array of strings on the opportunity
+      const tags = (opp.tags || []).map(t => (typeof t === 'string' ? t : (t.name || '')).toLowerCase().trim());
+
+      // Track all tags for debugging
+      tags.forEach(t => { if (t) allTags[t] = (allTags[t] || 0) + 1; });
+
+      // Bucket by tag: "facebook lead" → facebook, "sm3" → google, else → other
+      let bucket = 'other';
+      if (tags.some(t => t === 'facebook lead' || t.includes('facebook lead'))) {
+        bucket = 'facebook';
+      } else if (tags.some(t => t === 'sm3' || t.includes('sm3'))) {
+        bucket = 'google';
+      }
+
+      // Count as lead
+      sourceBuckets[bucket].leads++;
+      sourceBuckets.combined.leads++;
+
+      // Initialize month if needed
+      if (!sourceBuckets[bucket].byMonth[monthKey]) {
+        sourceBuckets[bucket].byMonth[monthKey] = { leads: 0, contracts: 0 };
+      }
+      if (!sourceBuckets.combined.byMonth[monthKey]) {
+        sourceBuckets.combined.byMonth[monthKey] = { leads: 0, contracts: 0 };
+      }
+      sourceBuckets[bucket].byMonth[monthKey].leads++;
+      sourceBuckets.combined.byMonth[monthKey].leads++;
+
+      // Check if this opportunity became a contract (has status indicating progression)
+      const status = (opp.status || '').toLowerCase();
+      const isContract = status.includes('won') || status.includes('contract')
+        || status.includes('listed') || status.includes('sold')
+        || status.includes('closed') || status.includes('under contract');
+      if (isContract) {
+        sourceBuckets[bucket].contracts++;
+        sourceBuckets.combined.contracts++;
+        sourceBuckets[bucket].byMonth[monthKey].contracts++;
+        sourceBuckets.combined.byMonth[monthKey].contracts++;
+      }
+    });
+
+    // Calculate leads-per-contract ratios
+    const result = {};
+    for (const [key, data] of Object.entries(sourceBuckets)) {
+      result[key] = {
+        leads: data.leads,
+        contracts: data.contracts,
+        leadsPerContract: data.contracts > 0 ? Math.round(data.leads / data.contracts * 10) / 10 : null,
+        conversionRate: data.leads > 0 ? Math.round(data.contracts / data.leads * 1000) / 10 : 0,
+        byMonth: data.byMonth,
+      };
+    }
+
+    return {
+      sources: result,
+      totalOpportunities: opportunities.length,
+      uniqueTags: allTags,
+      generatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error('Error computing lead source stats:', error);
+    throw error;
+  }
+}
+
+/**
  * CORS headers
  */
 function getCorsHeaders() {
@@ -333,6 +425,11 @@ export default {
 
       if (pathname === '/api/pipeline-stats') {
         const stats = await computePipelineStats(env);
+        return jsonResponse(stats);
+      }
+
+      if (pathname === '/api/lead-sources') {
+        const stats = await computeLeadSourceStats(env);
         return jsonResponse(stats);
       }
 
