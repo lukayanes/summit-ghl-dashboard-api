@@ -886,19 +886,45 @@ async function findComps(address, daysBack, env) {
 
   // Check priceHistory for the most recent sale event
   if (Array.isArray(p.priceHistory) && p.priceHistory.length > 0) {
-    const saleEvents = p.priceHistory.filter(e => e.event && (e.event.toLowerCase() === 'sold' || e.event.toLowerCase().includes('sold')));
+    // Sort all events by date descending
+    const sortedHistory = [...p.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+    const saleEvents = sortedHistory.filter(e => e.event && (e.event.toLowerCase() === 'sold' || e.event.toLowerCase().includes('sold')));
     if (saleEvents.length > 0) {
-      // Sort by date descending
-      saleEvents.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-      if (!lastSalePrice && saleEvents[0].price) lastSalePrice = saleEvents[0].price;
-      if (!lastSaleDate && saleEvents[0].date) lastSaleDate = saleEvents[0].date;
+      const mostRecentSale = saleEvents[0];
+      if (!lastSaleDate && mostRecentSale.date) lastSaleDate = mostRecentSale.date;
+      if (!lastSalePrice && mostRecentSale.price) lastSalePrice = mostRecentSale.price;
+
+      // Non-disclosure state fallback: if "Sold" has no price (shows "--"),
+      // look for the "Pending sale" event immediately before it — that price
+      // is almost always the actual sale price in non-disclosure states (TX, etc.)
+      if (!lastSalePrice) {
+        const saleIdx = sortedHistory.indexOf(mostRecentSale);
+        // Walk forward (older entries) from the sold event looking for Pending sale or last listed price
+        for (let hi = saleIdx + 1; hi < sortedHistory.length; hi++) {
+          const evt = sortedHistory[hi];
+          const evtType = (evt.event || '').toLowerCase();
+          if ((evtType.includes('pending') || evtType.includes('contingent')) && evt.price) {
+            lastSalePrice = evt.price;
+            break;
+          }
+          // Also accept the most recent "Price change" or "Listed for sale" before the sold event
+          if ((evtType.includes('price change') || evtType.includes('listed')) && evt.price) {
+            lastSalePrice = evt.price;
+            break;
+          }
+        }
+      }
     }
   }
 
-  // Also check taxHistory as a fallback
+  // Tax history fallback — some properties have assessed values
   if (!lastSalePrice && Array.isArray(p.taxHistory) && p.taxHistory.length > 0) {
-    const withValue = p.taxHistory.filter(t => t.taxPaid || t.value);
-    // taxHistory doesn't always have sale prices, but can give clues
+    const sorted = [...p.taxHistory].sort((a, b) => (b.time || 0) - (a.time || 0));
+    if (sorted[0] && sorted[0].value) {
+      // Tax assessed value is a rough proxy, not exact sale price — flag it
+      lastSalePrice = sorted[0].value;
+    }
   }
 
   const subject = {
@@ -981,8 +1007,31 @@ async function findComps(address, daysBack, env) {
     const compStatus = (comp.homeStatus || comp.statusType || comp.listingStatus || comp.status || '').toString().toLowerCase();
     if (compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent') return;
 
-    // Must have a SALE price — prioritize sold-specific fields over generic 'price'
-    const price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || comp.price || 0;
+    // ONLY use actual sold or pending sale prices — never Zestimate, listing, or generic price
+    let price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
+
+    // Non-disclosure state fallback: check priceHistory for sold or pending sale price ONLY
+    if (price <= 0 && Array.isArray(comp.priceHistory) && comp.priceHistory.length > 0) {
+      const sorted = [...comp.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+      // First pass: look for a Sold event with a price
+      for (let hi = 0; hi < sorted.length; hi++) {
+        const evtType = (sorted[hi].event || '').toLowerCase();
+        if ((evtType === 'sold' || evtType.includes('sold')) && sorted[hi].price) {
+          price = sorted[hi].price;
+          break;
+        }
+      }
+      // Second pass: if sold had no price (non-disclosure), grab the pending sale price
+      if (price <= 0) {
+        for (let hi = 0; hi < sorted.length; hi++) {
+          const evtType = (sorted[hi].event || '').toLowerCase();
+          if ((evtType.includes('pending') || evtType.includes('contingent')) && sorted[hi].price) {
+            price = sorted[hi].price;
+            break;
+          }
+        }
+      }
+    }
     if (price <= 0) return;
 
     // Skip if price looks like a monthly rent (under $10k and no sold date)
@@ -1016,7 +1065,7 @@ async function findComps(address, daysBack, env) {
       zpid: comp.zpid || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
       // Price source tracking — which field the price came from
-      _priceSource: comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : comp.lastSalePrice ? 'lastSalePrice' : comp.salePrice ? 'salePrice' : 'price',
+      _priceSource: comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : comp.lastSalePrice ? 'lastSalePrice' : 'priceHistory',
       // Scoring
       matchPct: scoring.matchPct,
       grade: scoring.grade,
