@@ -462,6 +462,42 @@ async function zillowGetByZpid(zpid, env) {
   return data;
 }
 
+// ==================== RENTOMETER API ====================
+
+const RENTOMETER_BASE = 'https://www.rentometer.com/api/v1';
+
+/**
+ * Rentometer Rent Summary (QuickView) — returns median, mean, range, samples
+ * Endpoint: GET /api/v1/summary
+ */
+async function rentometerSummary(address, bedrooms, env) {
+  if (!env.RENTOMETER_API_KEY) {
+    throw new Error('RENTOMETER_API_KEY not configured');
+  }
+
+  const cacheKey = 'rento_' + address + '_' + bedrooms;
+  const cached = getZillowCache(cacheKey); // reuse same cache system
+  if (cached) return cached;
+
+  const params = new URLSearchParams({
+    api_key: env.RENTOMETER_API_KEY,
+    address: address,
+    bedrooms: String(bedrooms || 3),
+    building_type: 'house',
+  });
+
+  const response = await fetch(`${RENTOMETER_BASE}/summary?${params.toString()}`);
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Rentometer API error: ${response.status} - ${text.substring(0, 200)}`);
+  }
+
+  const data = await response.json();
+  setZillowCache(cacheKey, data);
+  return data;
+}
+
 /**
  * Deep-extract all property-like objects from a Zillow API response.
  * Searches recursively for arrays/objects that look like property records
@@ -1140,6 +1176,17 @@ export default {
         if (!address) return errorResponse('address parameter required');
         if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
         const data = await zillowFullLookup(address, env);
+        return jsonResponse(data);
+      }
+
+      // ---- Rentometer API Routes ----
+
+      if (pathname === '/api/rentometer/summary') {
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        if (!env.RENTOMETER_API_KEY) return errorResponse('RENTOMETER_API_KEY not configured', 500);
+        const bedrooms = url.searchParams.get('bedrooms') || '3';
+        const data = await rentometerSummary(address, bedrooms, env);
         return jsonResponse(data);
       }
 
