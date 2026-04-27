@@ -476,8 +476,18 @@ function deepExtractProperties(obj, depth, maxDepth, subjectZpid) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
     const hasAddr = item.address || item.streetAddress || item.formattedAddress;
     const hasZpid = item.zpid;
-    const hasPrice = item.price || item.soldPrice || item.lastSoldPrice || item.lastSalePrice || item.salePrice;
+    const hasSoldPrice = item.soldPrice || item.lastSoldPrice || item.lastSalePrice || item.salePrice;
+    const hasPrice = hasSoldPrice || item.price;
     const hasBeds = item.bedrooms || item.beds;
+
+    // Filter out rental listings — these have rent prices, not sale prices
+    const status = (item.homeStatus || item.statusType || item.listingStatus || item.status || '').toString().toLowerCase();
+    if (status.includes('for_rent') || status.includes('rental') || status === 'rent') return false;
+
+    // If it only has a 'price' (no sold-specific fields) and the price is suspiciously low
+    // (under $5,000/mo range), it's probably a rent listing
+    if (!hasSoldPrice && item.price && item.price < 10000 && !item.lastSoldDate && !item.dateSold) return false;
+
     return (hasAddr || hasZpid) && (hasPrice || hasBeds);
   }
 
@@ -624,7 +634,7 @@ async function zillowFullLookup(address, env) {
     if (cZpid) seenCompZpids.add(cZpid);
     comps.push({
       address: comp.address || comp.streetAddress || comp.formattedAddress || '',
-      price: comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || 0,
+      price: comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || comp.price || 0,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
       livingArea: comp.livingArea || comp.livingAreaValue || comp.sqft || null,
@@ -890,9 +900,16 @@ async function findComps(address, daysBack, env) {
       if (!isNaN(soldDate.getTime()) && soldDate < cutoffDate) return;
     }
 
-    // Must have a price (sale price, last sold, or listing price)
-    const price = comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || 0;
+    // Filter out rental listings
+    const compStatus = (comp.homeStatus || comp.statusType || comp.listingStatus || comp.status || '').toString().toLowerCase();
+    if (compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent') return;
+
+    // Must have a SALE price — prioritize sold-specific fields over generic 'price'
+    const price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || comp.price || 0;
     if (price <= 0) return;
+
+    // Skip if price looks like a monthly rent (under $10k and no sold date)
+    if (price < 10000 && !soldDateStr) return;
 
     // Calculate distance if we have coords
     let distance = null;
@@ -914,10 +931,13 @@ async function findComps(address, daysBack, env) {
       lotSize: comp.lotSize || comp.lotAreaValue || null,
       yearBuilt: comp.yearBuilt || null,
       propertyType: comp.homeType || comp.propertyType || null,
+      homeStatus: comp.homeStatus || comp.statusType || comp.listingStatus || null,
       soldDate: soldDateStr,
       distance: distance ? Math.round(distance * 100) / 100 : null,
       zpid: comp.zpid || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
+      // Price source tracking — which field the price came from
+      _priceSource: comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : comp.lastSalePrice ? 'lastSalePrice' : comp.salePrice ? 'salePrice' : 'price',
       // Scoring
       matchPct: scoring.matchPct,
       grade: scoring.grade,
