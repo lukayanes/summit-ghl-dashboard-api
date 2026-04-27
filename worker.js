@@ -969,6 +969,8 @@ async function findComps(address, daysBack, env) {
       propertyType: comp.homeType || comp.propertyType || null,
       homeStatus: comp.homeStatus || comp.statusType || comp.listingStatus || null,
       soldDate: soldDateStr,
+      latitude: comp.latitude || null,
+      longitude: comp.longitude || null,
       distance: distance ? Math.round(distance * 100) / 100 : null,
       zpid: comp.zpid || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
