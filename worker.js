@@ -510,66 +510,128 @@ async function zillowFullLookup(address, env) {
 
   const zpid = p.zpid || null;
 
-  // Step 2: Search for recently sold comps in the same zip/area
+  // Step 2: Extract comps from multiple sources
+  // Source A: Check if property response already contains comps/nearby data
   let compData = null;
-  const zipMatch = address.match(/\d{5}/);
-  const zip = zipMatch ? zipMatch[0] : (p.zipcode || p.zip || null);
-  const city = p.city || '';
-  const state = p.state || '';
-  const searchLocation = zip || (city && state ? city + ', ' + state : '');
+  const compKeys = ['comps', 'comparables', 'nearbyHomes', 'nearbySales', 'recentlySold',
+    'similarHomes', 'nearbyProperties', 'soldNearby', 'homeValueChartData'];
+  let embeddedComps = null;
+  for (const key of compKeys) {
+    const val = p[key] || (propertyData && propertyData[key]);
+    if (val && ((Array.isArray(val) && val.length > 0) || (typeof val === 'object' && !Array.isArray(val)))) {
+      embeddedComps = val;
+      break;
+    }
+  }
 
-  if (searchLocation) {
-    try {
-      compData = await zillowSearch(searchLocation, 'recentlySold', env);
-    } catch (e) {
-      console.error('Comp search error:', e.message);
+  // Source B: Try the search endpoint for recently sold in the same area
+  if (!embeddedComps || (Array.isArray(embeddedComps) && embeddedComps.length === 0)) {
+    const zipMatch = address.match(/\d{5}/);
+    const zip = zipMatch ? zipMatch[0] : (p.zipcode || p.zip || null);
+    const city = p.city || '';
+    const state = p.state || '';
+    const searchLocation = zip || (city && state ? city + ', ' + state : '');
+
+    if (searchLocation) {
+      try {
+        compData = await zillowSearch(searchLocation, 'recentlySold', env);
+      } catch (e) {
+        console.error('Comp search error (non-fatal):', e.message);
+      }
     }
   }
 
   // Extract photos from the property data
-  // ZLLW API often includes photos in the property response
-  const photos = p.photos || p.images || p.responsivePhotos || p.hugePhotos || p.hiResImageLink || [];
+  // Recursively search for photo URLs in the response
   const photoUrls = [];
-  if (Array.isArray(photos)) {
-    photos.forEach(photo => {
-      if (typeof photo === 'string') {
-        photoUrls.push(photo);
-      } else if (photo.url) {
-        photoUrls.push(photo.url);
-      } else if (photo.mixedSources) {
-        const jpegSources = photo.mixedSources.jpeg || [];
-        if (jpegSources.length > 0) {
-          // Get the largest available
-          const best = jpegSources[jpegSources.length - 1];
-          photoUrls.push(best.url);
-        }
-      } else if (photo.caption !== undefined && photo.url === undefined) {
-        // Skip caption-only entries
+  const seenUrls = new Set();
+
+  function extractPhotosFromObj(obj, depth) {
+    if (!obj || depth > 5) return;
+    if (typeof obj === 'string') {
+      // Check if it looks like an image URL
+      if ((obj.includes('zillowstatic.com') || obj.includes('zillow.com') || obj.includes('.jpg') || obj.includes('.jpeg') || obj.includes('.png') || obj.includes('.webp')) && obj.startsWith('http') && !seenUrls.has(obj)) {
+        seenUrls.add(obj);
+        photoUrls.push(obj);
       }
-    });
-  } else if (typeof photos === 'string') {
-    photoUrls.push(photos);
+      return;
+    }
+    if (Array.isArray(obj)) {
+      obj.forEach(item => extractPhotosFromObj(item, depth + 1));
+      return;
+    }
+    if (typeof obj === 'object') {
+      // Prioritize known photo fields
+      const photoKeys = ['photos', 'images', 'responsivePhotos', 'hugePhotos', 'hiResImageLink', 'originalPhotos', 'photoGallery', 'media', 'photoUrls', 'imgSrc', 'url', 'fullUrl', 'highResImageLink'];
+      photoKeys.forEach(key => {
+        if (obj[key] !== undefined) {
+          extractPhotosFromObj(obj[key], depth + 1);
+        }
+      });
+      // Also check mixedSources pattern (Zillow nested photo format)
+      if (obj.mixedSources) {
+        const jpegSources = obj.mixedSources.jpeg || obj.mixedSources.webp || [];
+        if (Array.isArray(jpegSources) && jpegSources.length > 0) {
+          const best = jpegSources[jpegSources.length - 1];
+          if (best && best.url && !seenUrls.has(best.url)) {
+            seenUrls.add(best.url);
+            photoUrls.push(best.url);
+          }
+        }
+      }
+      // Check for direct image URL patterns in any field
+      Object.entries(obj).forEach(([key, val]) => {
+        if (typeof val === 'string' && !photoKeys.includes(key)) {
+          extractPhotosFromObj(val, depth + 1);
+        } else if (Array.isArray(val) && ['photos','images','responsivePhotos','originalPhotos','photoGallery','media'].includes(key)) {
+          // Already handled above
+        } else if (Array.isArray(val) && depth < 3) {
+          extractPhotosFromObj(val, depth + 1);
+        }
+      });
+    }
   }
 
-  // Extract comps from search results
+  extractPhotosFromObj(propertyData, 0);
+
+  // Extract comps — check embedded first, then search results
   const comps = [];
-  const compResults = compData?.results || compData?.props || compData?.searchResults || [];
+  const seenCompZpids = new Set();
+
+  function pushComp(comp) {
+    if (!comp || typeof comp !== 'object') return;
+    const cZpid = comp.zpid;
+    if (cZpid && (cZpid === zpid || seenCompZpids.has(cZpid))) return;
+    if (cZpid) seenCompZpids.add(cZpid);
+    comps.push({
+      address: comp.address || comp.streetAddress || comp.formattedAddress || '',
+      price: comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || 0,
+      bedrooms: comp.bedrooms || comp.beds || null,
+      bathrooms: comp.bathrooms || comp.baths || null,
+      livingArea: comp.livingArea || comp.livingAreaValue || comp.sqft || null,
+      lotSize: comp.lotSize || comp.lotAreaValue || null,
+      yearBuilt: comp.yearBuilt || null,
+      soldDate: comp.dateSold || comp.lastSoldDate || comp.datePosted || null,
+      distance: comp.distance || null,
+      zpid: cZpid || null,
+      imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
+    });
+  }
+
+  // Try embedded comps from the property response
+  if (embeddedComps) {
+    const compArr = Array.isArray(embeddedComps) ? embeddedComps : Object.values(embeddedComps);
+    compArr.forEach(pushComp);
+  }
+
+  // Try search results
+  const compResults = compData?.results || compData?.props || compData?.searchResults || compData?.data || [];
   if (Array.isArray(compResults)) {
-    compResults.forEach(comp => {
-      // Don't include the subject property in comps
-      if (comp.zpid && comp.zpid === zpid) return;
-      comps.push({
-        address: comp.address || comp.streetAddress || '',
-        price: comp.price || comp.soldPrice || comp.lastSoldPrice || 0,
-        bedrooms: comp.bedrooms || comp.beds || null,
-        bathrooms: comp.bathrooms || comp.baths || null,
-        livingArea: comp.livingArea || comp.sqft || null,
-        lotSize: comp.lotSize || comp.lotAreaValue || null,
-        yearBuilt: comp.yearBuilt || null,
-        soldDate: comp.dateSold || comp.lastSoldDate || null,
-        distance: comp.distance || null,
-        zpid: comp.zpid || null,
-      });
+    compResults.forEach(pushComp);
+  } else if (compData && typeof compData === 'object') {
+    // Some APIs return comps as a flat object with zpid keys
+    Object.values(compData).forEach(val => {
+      if (val && typeof val === 'object' && (val.address || val.zpid)) pushComp(val);
     });
   }
 
@@ -594,12 +656,279 @@ async function zillowFullLookup(address, env) {
     latitude: p.latitude || null,
     longitude: p.longitude || null,
     photos: photoUrls,
+    photoCount: photoUrls.length,
     comps: comps,
     rawProperty: propertyData,
     rawComps: compData,
+    _debug: {
+      topLevelKeys: Object.keys(propertyData || {}),
+      nestedKeys: Object.keys(p || {}).slice(0, 40),
+      photoFieldsFound: ['photos','images','responsivePhotos','hugePhotos','hiResImageLink','originalPhotos','photoGallery','media','imgSrc']
+        .filter(k => p[k] !== undefined || (propertyData && propertyData[k] !== undefined)),
+      compFieldsFound: ['comps','comparables','nearbyHomes','nearbySales','recentlySold','similarHomes','nearbyProperties']
+        .filter(k => p[k] !== undefined || (propertyData && propertyData[k] !== undefined)),
+      embeddedCompsFound: !!embeddedComps,
+      searchCompsFound: !!compData,
+      searchCompsKeys: compData ? Object.keys(compData).slice(0, 10) : [],
+    },
   };
 
   return summary;
+}
+
+// ==================== INTELLIGENT COMP FINDER ====================
+
+/**
+ * Haversine distance between two lat/lng points in miles
+ */
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const R = 3959; // Earth radius in miles
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * Score a potential comp against the subject property (0-100)
+ * Higher = better match
+ */
+function scoreComp(subject, comp) {
+  let score = 0;
+  let maxScore = 0;
+  const penalties = [];
+
+  // --- Sqft similarity (25 pts) ---
+  maxScore += 25;
+  const sSqft = subject.livingArea || 0;
+  const cSqft = comp.livingArea || comp.sqft || 0;
+  if (sSqft > 0 && cSqft > 0) {
+    const sqftRatio = Math.min(sSqft, cSqft) / Math.max(sSqft, cSqft);
+    if (sqftRatio >= 0.85) score += 25;
+    else if (sqftRatio >= 0.75) score += 18;
+    else if (sqftRatio >= 0.60) score += 10;
+    else { score += 3; penalties.push('Sqft diff >' + Math.round((1-sqftRatio)*100) + '%'); }
+  }
+
+  // --- Bed count (15 pts) ---
+  maxScore += 15;
+  const sBeds = subject.bedrooms || 0;
+  const cBeds = comp.bedrooms || comp.beds || 0;
+  if (sBeds > 0 && cBeds > 0) {
+    const bedDiff = Math.abs(sBeds - cBeds);
+    if (bedDiff === 0) score += 15;
+    else if (bedDiff === 1) score += 10;
+    else { score += 3; penalties.push(bedDiff + ' bed diff'); }
+  }
+
+  // --- Bath count (10 pts) ---
+  maxScore += 10;
+  const sBaths = subject.bathrooms || 0;
+  const cBaths = comp.bathrooms || comp.baths || 0;
+  if (sBaths > 0 && cBaths > 0) {
+    const bathDiff = Math.abs(sBaths - cBaths);
+    if (bathDiff === 0) score += 10;
+    else if (bathDiff <= 1) score += 7;
+    else { score += 2; penalties.push(bathDiff + ' bath diff'); }
+  }
+
+  // --- Lot size similarity (10 pts) ---
+  maxScore += 10;
+  const sLot = subject.lotSize || 0;
+  const cLot = comp.lotSize || comp.lotAreaValue || 0;
+  if (sLot > 0 && cLot > 0) {
+    const lotRatio = Math.min(sLot, cLot) / Math.max(sLot, cLot);
+    if (lotRatio >= 0.70) score += 10;
+    else if (lotRatio >= 0.50) score += 6;
+    else { score += 2; penalties.push('Lot size diff'); }
+  }
+
+  // --- Year built (10 pts) ---
+  maxScore += 10;
+  const sYear = subject.yearBuilt || 0;
+  const cYear = comp.yearBuilt || 0;
+  if (sYear > 0 && cYear > 0) {
+    const yearDiff = Math.abs(sYear - cYear);
+    if (yearDiff <= 5) score += 10;
+    else if (yearDiff <= 15) score += 7;
+    else if (yearDiff <= 30) score += 4;
+    else { score += 1; penalties.push(yearDiff + 'yr age diff'); }
+  }
+
+  // --- Distance (20 pts) ---
+  maxScore += 20;
+  const dist = comp._distance || 999;
+  if (dist <= 0.25) score += 20;
+  else if (dist <= 0.5) score += 17;
+  else if (dist <= 1.0) score += 13;
+  else if (dist <= 2.0) score += 8;
+  else if (dist <= 5.0) score += 4;
+  else { score += 1; penalties.push(dist.toFixed(1) + ' mi away'); }
+
+  // --- Property type match (5 pts) ---
+  maxScore += 5;
+  const sType = (subject.propertyType || subject.homeType || '').toLowerCase();
+  const cType = (comp.homeType || comp.propertyType || '').toLowerCase();
+  if (sType && cType && (sType.includes(cType) || cType.includes(sType) || sType === cType)) {
+    score += 5;
+  } else if (sType && cType) {
+    penalties.push('Type: ' + cType);
+  }
+
+  // --- Recency bonus (5 pts) ---
+  maxScore += 5;
+  const soldDate = comp.dateSold || comp.lastSoldDate || comp.datePosted || null;
+  if (soldDate) {
+    const daysAgo = Math.floor((Date.now() - new Date(soldDate).getTime()) / (1000 * 60 * 60 * 24));
+    if (daysAgo <= 30) score += 5;
+    else if (daysAgo <= 60) score += 3;
+    else if (daysAgo <= 90) score += 2;
+    else score += 1;
+  }
+
+  const pct = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0;
+
+  return {
+    score: score,
+    maxScore: maxScore,
+    matchPct: pct,
+    penalties: penalties,
+    grade: pct >= 85 ? 'A' : pct >= 70 ? 'B' : pct >= 55 ? 'C' : pct >= 40 ? 'D' : 'F',
+  };
+}
+
+/**
+ * Find comps for a subject property
+ * 1. Get subject details from Zillow
+ * 2. Search recently sold in the same zip
+ * 3. Score & rank each sold property
+ */
+async function findComps(address, daysBack, env) {
+  // Step 1: Get subject property details
+  let propertyData;
+  try {
+    propertyData = await zillowGetByAddress(address, env);
+  } catch (e) {
+    return { error: 'Could not fetch subject property: ' + e.message };
+  }
+
+  const p = propertyData?.propertyDetails || propertyData?.data || propertyData || {};
+  if (!p || (!p.zpid && !p.address && !p.bedrooms)) {
+    return { error: 'No Zillow data found for this address', rawResponse: propertyData };
+  }
+
+  const subject = {
+    zpid: p.zpid,
+    address: p.address || p.streetAddress || address,
+    bedrooms: p.bedrooms || p.beds || null,
+    bathrooms: p.bathrooms || p.baths || null,
+    livingArea: p.livingArea || p.livingAreaValue || p.sqft || null,
+    lotSize: p.lotAreaValue || p.lotSize || null,
+    yearBuilt: p.yearBuilt || null,
+    propertyType: p.homeType || p.propertyType || null,
+    latitude: p.latitude || null,
+    longitude: p.longitude || null,
+    zestimate: p.zestimate || null,
+    rentZestimate: p.rentZestimate || null,
+    zipcode: p.zipcode || p.zip || null,
+    city: p.city || null,
+    state: p.state || null,
+  };
+
+  // Step 2: Search recently sold in the same zip/area
+  const zipMatch = address.match(/\d{5}/);
+  const searchLocation = zipMatch ? zipMatch[0] : (subject.zipcode || subject.city + ', ' + subject.state);
+
+  if (!searchLocation) {
+    return { error: 'Could not determine search area for comps', subject };
+  }
+
+  let searchData;
+  try {
+    searchData = await zillowSearch(searchLocation, 'recentlySold', env);
+  } catch (e) {
+    return { error: 'Search failed: ' + e.message, subject };
+  }
+
+  // Extract sold properties from search results
+  const soldList = searchData?.results || searchData?.props || searchData?.searchResults || searchData?.data || [];
+  const soldArr = Array.isArray(soldList) ? soldList : (typeof soldList === 'object' ? Object.values(soldList) : []);
+
+  // Step 3: Filter by days and score each
+  const cutoffDate = new Date(Date.now() - (daysBack || 90) * 24 * 60 * 60 * 1000);
+  const scoredComps = [];
+
+  soldArr.forEach(comp => {
+    if (!comp || typeof comp !== 'object') return;
+    // Skip the subject property itself
+    if (comp.zpid && comp.zpid === subject.zpid) return;
+
+    // Date filter
+    const soldDateStr = comp.dateSold || comp.lastSoldDate || comp.datePosted || null;
+    if (soldDateStr) {
+      const soldDate = new Date(soldDateStr);
+      if (soldDate < cutoffDate) return;
+    }
+
+    // Must have a sale price
+    const price = comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
+    if (price <= 0) return;
+
+    // Calculate distance if we have coords
+    let distance = null;
+    if (subject.latitude && subject.longitude && comp.latitude && comp.longitude) {
+      distance = haversineDistance(subject.latitude, subject.longitude, comp.latitude, comp.longitude);
+      // Skip if > 5 miles
+      if (distance > 5) return;
+    }
+
+    comp._distance = distance;
+    const scoring = scoreComp(subject, comp);
+
+    scoredComps.push({
+      address: comp.address || comp.streetAddress || comp.formattedAddress || '',
+      price: price,
+      bedrooms: comp.bedrooms || comp.beds || null,
+      bathrooms: comp.bathrooms || comp.baths || null,
+      livingArea: comp.livingArea || comp.sqft || null,
+      lotSize: comp.lotSize || comp.lotAreaValue || null,
+      yearBuilt: comp.yearBuilt || null,
+      propertyType: comp.homeType || comp.propertyType || null,
+      soldDate: soldDateStr,
+      distance: distance ? Math.round(distance * 100) / 100 : null,
+      zpid: comp.zpid || null,
+      imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
+      // Scoring
+      matchPct: scoring.matchPct,
+      grade: scoring.grade,
+      scoreBreakdown: scoring,
+    });
+  });
+
+  // Sort by match percentage (best first)
+  scoredComps.sort((a, b) => b.matchPct - a.matchPct);
+
+  // Calculate ARV from top comps (grade A or B, or top 5)
+  const topComps = scoredComps.filter(c => c.grade === 'A' || c.grade === 'B').slice(0, 5);
+  const arvComps = topComps.length >= 3 ? topComps : scoredComps.slice(0, 5);
+  const arvPrices = arvComps.map(c => c.price).filter(p => p > 0);
+  const avgARV = arvPrices.length > 0 ? Math.round(arvPrices.reduce((a, b) => a + b, 0) / arvPrices.length) : null;
+  const medianARV = arvPrices.length > 0 ? arvPrices.sort((a, b) => a - b)[Math.floor(arvPrices.length / 2)] : null;
+
+  return {
+    subject: subject,
+    comps: scoredComps,
+    compCount: scoredComps.length,
+    totalSearchResults: soldArr.length,
+    daysBack: daysBack || 90,
+    suggestedARV: avgARV,
+    medianARV: medianARV,
+    arvCompsUsed: arvComps.length,
+    zestimate: subject.zestimate,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -724,6 +1053,16 @@ export default {
         if (!address && !zpid) return errorResponse('address or zpid parameter required');
         if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
         const data = zpid ? await zillowGetByZpid(zpid, env) : await zillowGetByAddress(address, env);
+        return jsonResponse(data);
+      }
+
+      if (pathname === '/api/zillow/find-comps') {
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        const days = parseInt(url.searchParams.get('days')) || 90;
+        const data = await findComps(address, days, env);
+        if (data.error) return errorResponse(data.error, 400);
         return jsonResponse(data);
       }
 
