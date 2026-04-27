@@ -1171,6 +1171,49 @@ export default {
         });
       }
 
+      // Fetch photos for a single property by zpid
+      if (pathname === '/api/zillow/photos') {
+        const zpid = url.searchParams.get('zpid');
+        if (!zpid) return errorResponse('zpid parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        try {
+          const data = await zillowGetByZpid(zpid, env);
+          const photoUrls = [];
+          const seenUrls = new Set();
+          function extractPhotos(obj, depth) {
+            if (!obj || depth > 5) return;
+            if (typeof obj === 'string') {
+              if ((obj.includes('zillowstatic.com') || obj.includes('.jpg') || obj.includes('.jpeg') || obj.includes('.png') || obj.includes('.webp')) && obj.startsWith('http') && !seenUrls.has(obj)) {
+                seenUrls.add(obj);
+                photoUrls.push(obj);
+              }
+              return;
+            }
+            if (Array.isArray(obj)) { obj.forEach(item => extractPhotos(item, depth + 1)); return; }
+            if (typeof obj === 'object') {
+              if (obj.mixedSources) {
+                const jpegSrc = obj.mixedSources.jpeg || obj.mixedSources.webp || [];
+                if (Array.isArray(jpegSrc) && jpegSrc.length > 0) {
+                  const best = jpegSrc[jpegSrc.length - 1];
+                  if (best && best.url && !seenUrls.has(best.url)) { seenUrls.add(best.url); photoUrls.push(best.url); }
+                }
+              }
+              Object.values(obj).forEach(val => extractPhotos(val, depth + 1));
+            }
+          }
+          extractPhotos(data, 0);
+          const p = data?.propertyDetails || data?.data || data || {};
+          return jsonResponse({
+            zpid: zpid,
+            address: p.address || p.streetAddress || '',
+            photos: photoUrls,
+            photoCount: photoUrls.length,
+          });
+        } catch (e) {
+          return errorResponse('Failed to fetch photos: ' + e.message);
+        }
+      }
+
       if (pathname === '/api/zillow/lookup') {
         const address = url.searchParams.get('address');
         if (!address) return errorResponse('address parameter required');
