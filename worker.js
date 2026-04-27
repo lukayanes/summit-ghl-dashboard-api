@@ -864,6 +864,22 @@ async function findComps(address, daysBack, env) {
     return { error: 'No Zillow data found for this address', rawResponse: propertyData };
   }
 
+  // Extract subject photos from various Zillow response shapes
+  const subjectPhotos = [];
+  const photoSources = p.photos || p.responsivePhotos || p.hugePhotos || p.hiResPhotos || [];
+  if (Array.isArray(photoSources)) {
+    photoSources.forEach(photo => {
+      if (typeof photo === 'string') { subjectPhotos.push(photo); }
+      else if (photo?.url) { subjectPhotos.push(photo.url); }
+      else if (photo?.mixedSources?.jpeg) {
+        // Zillow responsive format — pick the largest
+        const jpegs = photo.mixedSources.jpeg;
+        const largest = jpegs.reduce((best, cur) => ((cur.width || 0) > (best.width || 0) ? cur : best), jpegs[0]);
+        if (largest?.url) subjectPhotos.push(largest.url);
+      }
+    });
+  }
+
   const subject = {
     zpid: p.zpid,
     address: p.address || p.streetAddress || address,
@@ -880,6 +896,8 @@ async function findComps(address, daysBack, env) {
     zipcode: p.zipcode || p.zip || null,
     city: p.city || null,
     state: p.state || null,
+    imgSrc: p.imgSrc || p.streetViewTileImageUrlMediumAddress || (subjectPhotos.length > 0 ? subjectPhotos[0] : null),
+    photos: subjectPhotos.slice(0, 30),
   };
 
   // Step 2: Deep-extract all property-like objects from the response
