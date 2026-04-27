@@ -379,6 +379,229 @@ async function computeLeadSourceStats(env, monthsBack) {
   }
 }
 
+// ==================== ZILLOW API (RapidAPI) ====================
+
+const ZILLOW_API_HOST = 'zllw-working-api.p.rapidapi.com';
+
+/**
+ * Zillow API cache (separate from GHL cache)
+ */
+let zillowCache = {};
+const ZILLOW_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+function getZillowCache(key) {
+  const entry = zillowCache[key];
+  if (entry && (Date.now() - entry.timestamp) < ZILLOW_CACHE_TTL) {
+    return entry.data;
+  }
+  return null;
+}
+
+function setZillowCache(key, data) {
+  zillowCache[key] = { data, timestamp: Date.now() };
+  // Limit cache size
+  const keys = Object.keys(zillowCache);
+  if (keys.length > 100) {
+    const oldest = keys.sort((a, b) => zillowCache[a].timestamp - zillowCache[b].timestamp);
+    oldest.slice(0, 20).forEach(k => delete zillowCache[k]);
+  }
+}
+
+/**
+ * Make authenticated request to Zillow RapidAPI
+ */
+async function zillowRequest(path, env) {
+  if (!env.ZILLOW_API_KEY) {
+    throw new Error('ZILLOW_API_KEY not configured');
+  }
+
+  const url = `https://${ZILLOW_API_HOST}${path}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'x-rapidapi-key': env.ZILLOW_API_KEY,
+      'x-rapidapi-host': ZILLOW_API_HOST,
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Zillow API error: ${response.status} ${response.statusText} - ${text.substring(0, 200)}`);
+  }
+
+  return await response.json();
+}
+
+/**
+ * Get property info by address (ZLLW Working API - Property Info Advanced)
+ * Endpoint: /byaddress
+ */
+async function zillowGetByAddress(address, env) {
+  const cacheKey = 'addr_' + address;
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  const encoded = encodeURIComponent(address);
+  const data = await zillowRequest(`/pro/byaddress?propertyaddress=${encoded}`, env);
+  setZillowCache(cacheKey, data);
+  return data;
+}
+
+/**
+ * Get detailed property info by zpid (ZLLW Working API)
+ * Endpoint: /byzpid
+ */
+async function zillowGetByZpid(zpid, env) {
+  const cacheKey = 'zpid_' + zpid;
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  const data = await zillowRequest(`/pro/byzpid?zpid=${zpid}`, env);
+  setZillowCache(cacheKey, data);
+  return data;
+}
+
+/**
+ * Search properties in an area (ZLLW Working API - Search)
+ * Used for finding comps near a location
+ */
+async function zillowSearch(location, statusType, env) {
+  const cacheKey = 'search_' + location + '_' + statusType;
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  const encoded = encodeURIComponent(location);
+  const data = await zillowRequest(`/pro/search?location=${encoded}&status=${statusType || 'recentlySold'}`, env);
+  setZillowCache(cacheKey, data);
+  return data;
+}
+
+/**
+ * Full property lookup: get property by address, then search for comps nearby
+ * Returns a combined payload for the Dispo tab
+ */
+async function zillowFullLookup(address, env) {
+  // Step 1: Get property details by address
+  let propertyData = null;
+  try {
+    propertyData = await zillowGetByAddress(address, env);
+  } catch (e) {
+    return {
+      found: false,
+      address: address,
+      message: 'Zillow API error: ' + e.message,
+      error: e.message,
+    };
+  }
+
+  // The ZLLW Working API returns property data directly or nested
+  // Handle various response shapes
+  const p = propertyData?.propertyDetails || propertyData?.data || propertyData || {};
+
+  if (!p || (!p.zpid && !p.address && !p.streetAddress && !p.bedrooms)) {
+    return {
+      found: false,
+      address: address,
+      message: 'No Zillow data found for this address. Try the full street address with city, state, zip.',
+      rawResponse: propertyData,
+    };
+  }
+
+  const zpid = p.zpid || null;
+
+  // Step 2: Search for recently sold comps in the same zip/area
+  let compData = null;
+  const zipMatch = address.match(/\d{5}/);
+  const zip = zipMatch ? zipMatch[0] : (p.zipcode || p.zip || null);
+  const city = p.city || '';
+  const state = p.state || '';
+  const searchLocation = zip || (city && state ? city + ', ' + state : '');
+
+  if (searchLocation) {
+    try {
+      compData = await zillowSearch(searchLocation, 'recentlySold', env);
+    } catch (e) {
+      console.error('Comp search error:', e.message);
+    }
+  }
+
+  // Extract photos from the property data
+  // ZLLW API often includes photos in the property response
+  const photos = p.photos || p.images || p.responsivePhotos || p.hugePhotos || p.hiResImageLink || [];
+  const photoUrls = [];
+  if (Array.isArray(photos)) {
+    photos.forEach(photo => {
+      if (typeof photo === 'string') {
+        photoUrls.push(photo);
+      } else if (photo.url) {
+        photoUrls.push(photo.url);
+      } else if (photo.mixedSources) {
+        const jpegSources = photo.mixedSources.jpeg || [];
+        if (jpegSources.length > 0) {
+          // Get the largest available
+          const best = jpegSources[jpegSources.length - 1];
+          photoUrls.push(best.url);
+        }
+      } else if (photo.caption !== undefined && photo.url === undefined) {
+        // Skip caption-only entries
+      }
+    });
+  } else if (typeof photos === 'string') {
+    photoUrls.push(photos);
+  }
+
+  // Extract comps from search results
+  const comps = [];
+  const compResults = compData?.results || compData?.props || compData?.searchResults || [];
+  if (Array.isArray(compResults)) {
+    compResults.forEach(comp => {
+      // Don't include the subject property in comps
+      if (comp.zpid && comp.zpid === zpid) return;
+      comps.push({
+        address: comp.address || comp.streetAddress || '',
+        price: comp.price || comp.soldPrice || comp.lastSoldPrice || 0,
+        bedrooms: comp.bedrooms || comp.beds || null,
+        bathrooms: comp.bathrooms || comp.baths || null,
+        livingArea: comp.livingArea || comp.sqft || null,
+        lotSize: comp.lotSize || comp.lotAreaValue || null,
+        yearBuilt: comp.yearBuilt || null,
+        soldDate: comp.dateSold || comp.lastSoldDate || null,
+        distance: comp.distance || null,
+        zpid: comp.zpid || null,
+      });
+    });
+  }
+
+  // Build clean summary
+  const summary = {
+    found: true,
+    zpid: zpid,
+    address: p.address || p.streetAddress || address,
+    fullAddress: [p.streetAddress || p.address, p.city, p.state, p.zipcode].filter(Boolean).join(', '),
+    bedrooms: p.bedrooms || p.beds || null,
+    bathrooms: p.bathrooms || p.baths || null,
+    livingArea: p.livingArea || p.livingAreaValue || p.sqft || null,
+    lotSize: p.lotAreaValue || p.lotSize || null,
+    lotUnit: p.lotAreaUnit || 'sqft',
+    yearBuilt: p.yearBuilt || null,
+    propertyType: p.homeType || p.propertyType || p.homeTypeDimension || null,
+    zestimate: p.zestimate || null,
+    rentZestimate: p.rentZestimate || null,
+    price: p.price || null,
+    taxAssessedValue: p.taxAssessedValue || null,
+    description: p.description || null,
+    latitude: p.latitude || null,
+    longitude: p.longitude || null,
+    photos: photoUrls,
+    comps: comps,
+    rawProperty: propertyData,
+    rawComps: compData,
+  };
+
+  return summary;
+}
+
 /**
  * CORS headers
  */
@@ -482,6 +705,34 @@ export default {
           sampleOpportunity: opps.length > 0 ? opps[0] : null,
           opportunityKeys: opps.length > 0 ? Object.keys(opps[0]) : [],
         });
+      }
+
+      // ---- Zillow API Routes ----
+
+      if (pathname === '/api/zillow/search') {
+        const location = url.searchParams.get('location') || url.searchParams.get('address');
+        const status = url.searchParams.get('status') || 'recentlySold';
+        if (!location) return errorResponse('location parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        const data = await zillowSearch(location, status, env);
+        return jsonResponse(data);
+      }
+
+      if (pathname === '/api/zillow/property') {
+        const address = url.searchParams.get('address');
+        const zpid = url.searchParams.get('zpid');
+        if (!address && !zpid) return errorResponse('address or zpid parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        const data = zpid ? await zillowGetByZpid(zpid, env) : await zillowGetByAddress(address, env);
+        return jsonResponse(data);
+      }
+
+      if (pathname === '/api/zillow/lookup') {
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        const data = await zillowFullLookup(address, env);
+        return jsonResponse(data);
       }
 
       if (pathname === '/health') {
