@@ -463,18 +463,64 @@ async function zillowGetByZpid(zpid, env) {
 }
 
 /**
- * Search properties in an area (ZLLW Working API - Search)
- * Used for finding comps near a location
+ * Deep-extract all property-like objects from a Zillow API response.
+ * Searches recursively for arrays/objects that look like property records
+ * (have address/zpid/price fields). Used to find embedded comps, nearby sales, etc.
  */
-async function zillowSearch(location, statusType, env) {
-  const cacheKey = 'search_' + location + '_' + statusType;
-  const cached = getZillowCache(cacheKey);
-  if (cached) return cached;
+function deepExtractProperties(obj, depth, maxDepth, subjectZpid) {
+  if (!obj || depth > maxDepth) return [];
+  const results = [];
+  const seen = new Set();
 
-  const encoded = encodeURIComponent(location);
-  const data = await zillowRequest(`/pro/search?location=${encoded}&status=${statusType || 'recentlySold'}`, env);
-  setZillowCache(cacheKey, data);
-  return data;
+  function looksLikeProperty(item) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const hasAddr = item.address || item.streetAddress || item.formattedAddress;
+    const hasZpid = item.zpid;
+    const hasPrice = item.price || item.soldPrice || item.lastSoldPrice || item.lastSalePrice || item.salePrice;
+    const hasBeds = item.bedrooms || item.beds;
+    return (hasAddr || hasZpid) && (hasPrice || hasBeds);
+  }
+
+  function extract(node, d) {
+    if (!node || d > maxDepth) return;
+    if (Array.isArray(node)) {
+      node.forEach(item => {
+        if (looksLikeProperty(item)) {
+          const id = item.zpid || (item.address || item.streetAddress || '') + '_' + (item.price || item.soldPrice || '');
+          if (id && !seen.has(id) && item.zpid !== subjectZpid) {
+            seen.add(id);
+            results.push(item);
+          }
+        }
+        extract(item, d + 1);
+      });
+    } else if (typeof node === 'object') {
+      // Check known comp/nearby keys first (higher priority)
+      const compKeys = ['comps', 'comparables', 'nearbyHomes', 'nearbySales', 'recentlySold',
+        'similarHomes', 'nearbyProperties', 'soldNearby', 'nearbyAssessments',
+        'homeRecommendations', 'recommendations', 'listResults', 'results', 'props',
+        'searchResults', 'categoryTotals', 'relaxedResults', 'mapResults'];
+      for (const key of compKeys) {
+        if (node[key]) extract(node[key], d + 1);
+      }
+      // Then check all other keys
+      Object.entries(node).forEach(([key, val]) => {
+        if (!compKeys.includes(key) && val && typeof val === 'object') {
+          if (looksLikeProperty(val)) {
+            const id = val.zpid || (val.address || val.streetAddress || '') + '_' + (val.price || val.soldPrice || '');
+            if (id && !seen.has(id) && val.zpid !== subjectZpid) {
+              seen.add(id);
+              results.push(val);
+            }
+          }
+          extract(val, d + 1);
+        }
+      });
+    }
+  }
+
+  extract(obj, 0);
+  return results;
 }
 
 /**
@@ -510,36 +556,9 @@ async function zillowFullLookup(address, env) {
 
   const zpid = p.zpid || null;
 
-  // Step 2: Extract comps from multiple sources
-  // Source A: Check if property response already contains comps/nearby data
-  let compData = null;
-  const compKeys = ['comps', 'comparables', 'nearbyHomes', 'nearbySales', 'recentlySold',
-    'similarHomes', 'nearbyProperties', 'soldNearby', 'homeValueChartData'];
-  let embeddedComps = null;
-  for (const key of compKeys) {
-    const val = p[key] || (propertyData && propertyData[key]);
-    if (val && ((Array.isArray(val) && val.length > 0) || (typeof val === 'object' && !Array.isArray(val)))) {
-      embeddedComps = val;
-      break;
-    }
-  }
-
-  // Source B: Try the search endpoint for recently sold in the same area
-  if (!embeddedComps || (Array.isArray(embeddedComps) && embeddedComps.length === 0)) {
-    const zipMatch = address.match(/\d{5}/);
-    const zip = zipMatch ? zipMatch[0] : (p.zipcode || p.zip || null);
-    const city = p.city || '';
-    const state = p.state || '';
-    const searchLocation = zip || (city && state ? city + ', ' + state : '');
-
-    if (searchLocation) {
-      try {
-        compData = await zillowSearch(searchLocation, 'recentlySold', env);
-      } catch (e) {
-        console.error('Comp search error (non-fatal):', e.message);
-      }
-    }
-  }
+  // Step 2: Extract comps from property response using deep extraction
+  // The ZLLW API embeds nearby sales, comps, similar homes in the property response
+  const extractedProperties = deepExtractProperties(propertyData, 0, 6, zpid);
 
   // Extract photos from the property data
   // Recursively search for photo URLs in the response
@@ -594,14 +613,14 @@ async function zillowFullLookup(address, env) {
 
   extractPhotosFromObj(propertyData, 0);
 
-  // Extract comps — check embedded first, then search results
+  // Build comps from extracted properties
   const comps = [];
   const seenCompZpids = new Set();
 
-  function pushComp(comp) {
+  extractedProperties.forEach(comp => {
     if (!comp || typeof comp !== 'object') return;
     const cZpid = comp.zpid;
-    if (cZpid && (cZpid === zpid || seenCompZpids.has(cZpid))) return;
+    if (cZpid && seenCompZpids.has(cZpid)) return;
     if (cZpid) seenCompZpids.add(cZpid);
     comps.push({
       address: comp.address || comp.streetAddress || comp.formattedAddress || '',
@@ -616,24 +635,7 @@ async function zillowFullLookup(address, env) {
       zpid: cZpid || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
     });
-  }
-
-  // Try embedded comps from the property response
-  if (embeddedComps) {
-    const compArr = Array.isArray(embeddedComps) ? embeddedComps : Object.values(embeddedComps);
-    compArr.forEach(pushComp);
-  }
-
-  // Try search results
-  const compResults = compData?.results || compData?.props || compData?.searchResults || compData?.data || [];
-  if (Array.isArray(compResults)) {
-    compResults.forEach(pushComp);
-  } else if (compData && typeof compData === 'object') {
-    // Some APIs return comps as a flat object with zpid keys
-    Object.values(compData).forEach(val => {
-      if (val && typeof val === 'object' && (val.address || val.zpid)) pushComp(val);
-    });
-  }
+  });
 
   // Build clean summary
   const summary = {
@@ -659,7 +661,6 @@ async function zillowFullLookup(address, env) {
     photoCount: photoUrls.length,
     comps: comps,
     rawProperty: propertyData,
-    rawComps: compData,
     _debug: {
       topLevelKeys: Object.keys(propertyData || {}),
       nestedKeys: Object.keys(p || {}).slice(0, 40),
@@ -667,9 +668,7 @@ async function zillowFullLookup(address, env) {
         .filter(k => p[k] !== undefined || (propertyData && propertyData[k] !== undefined)),
       compFieldsFound: ['comps','comparables','nearbyHomes','nearbySales','recentlySold','similarHomes','nearbyProperties']
         .filter(k => p[k] !== undefined || (propertyData && propertyData[k] !== undefined)),
-      embeddedCompsFound: !!embeddedComps,
-      searchCompsFound: !!compData,
-      searchCompsKeys: compData ? Object.keys(compData).slice(0, 10) : [],
+      extractedPropertyCount: extractedProperties.length,
     },
   };
 
@@ -837,48 +836,67 @@ async function findComps(address, daysBack, env) {
     state: p.state || null,
   };
 
-  // Step 2: Search recently sold in the same zip/area
-  const zipMatch = address.match(/\d{5}/);
-  const searchLocation = zipMatch ? zipMatch[0] : (subject.zipcode || subject.city + ', ' + subject.state);
+  // Step 2: Deep-extract all property-like objects from the response
+  // The ZLLW API embeds comps, nearby sales, similar homes in the property data
+  const extractedProperties = deepExtractProperties(propertyData, 0, 6, subject.zpid);
 
-  if (!searchLocation) {
-    return { error: 'Could not determine search area for comps', subject };
+  // Step 2b: If we have zpids from extracted properties that lack full data, try fetching them
+  // Also try fetching comps by zpid if the property response includes a comps list with just zpids
+  const zpidsToFetch = [];
+  const fullDataProps = [];
+
+  extractedProperties.forEach(ep => {
+    const hasFullData = (ep.livingArea || ep.sqft || ep.bedrooms || ep.beds) && (ep.price || ep.soldPrice || ep.lastSoldPrice);
+    if (hasFullData) {
+      fullDataProps.push(ep);
+    } else if (ep.zpid) {
+      zpidsToFetch.push(ep.zpid);
+    }
+  });
+
+  // Fetch up to 10 individual zpids for more detail (parallel, with error tolerance)
+  if (zpidsToFetch.length > 0) {
+    const toFetch = zpidsToFetch.slice(0, 10);
+    const fetched = await Promise.allSettled(
+      toFetch.map(zpid => zillowGetByZpid(zpid, env))
+    );
+    fetched.forEach(result => {
+      if (result.status === 'fulfilled' && result.value) {
+        const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
+        if (fd.zpid || fd.address || fd.streetAddress) {
+          fullDataProps.push(fd);
+        }
+      }
+    });
   }
-
-  let searchData;
-  try {
-    searchData = await zillowSearch(searchLocation, 'recentlySold', env);
-  } catch (e) {
-    return { error: 'Search failed: ' + e.message, subject };
-  }
-
-  // Extract sold properties from search results
-  const soldList = searchData?.results || searchData?.props || searchData?.searchResults || searchData?.data || [];
-  const soldArr = Array.isArray(soldList) ? soldList : (typeof soldList === 'object' ? Object.values(soldList) : []);
 
   // Step 3: Filter by days and score each
   const cutoffDate = new Date(Date.now() - (daysBack || 90) * 24 * 60 * 60 * 1000);
   const scoredComps = [];
+  const seenZpids = new Set();
 
-  soldArr.forEach(comp => {
+  fullDataProps.forEach(comp => {
     if (!comp || typeof comp !== 'object') return;
     // Skip the subject property itself
     if (comp.zpid && comp.zpid === subject.zpid) return;
+    // Skip dupes
+    if (comp.zpid && seenZpids.has(comp.zpid)) return;
+    if (comp.zpid) seenZpids.add(comp.zpid);
 
-    // Date filter
-    const soldDateStr = comp.dateSold || comp.lastSoldDate || comp.datePosted || null;
+    // Date filter — if sold date is available, check it
+    const soldDateStr = comp.dateSold || comp.lastSoldDate || comp.datePosted || comp.dateSoldString || null;
     if (soldDateStr) {
       const soldDate = new Date(soldDateStr);
-      if (soldDate < cutoffDate) return;
+      if (!isNaN(soldDate.getTime()) && soldDate < cutoffDate) return;
     }
 
-    // Must have a sale price
-    const price = comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
+    // Must have a price (sale price, last sold, or listing price)
+    const price = comp.price || comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || 0;
     if (price <= 0) return;
 
     // Calculate distance if we have coords
     let distance = null;
-    if (subject.latitude && subject.longitude && comp.latitude && comp.longitude) {
+    if (subject.latitude && subject.longitude && (comp.latitude && comp.longitude)) {
       distance = haversineDistance(subject.latitude, subject.longitude, comp.latitude, comp.longitude);
       // Skip if > 5 miles
       if (distance > 5) return;
@@ -892,7 +910,7 @@ async function findComps(address, daysBack, env) {
       price: price,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
-      livingArea: comp.livingArea || comp.sqft || null,
+      livingArea: comp.livingArea || comp.livingAreaValue || comp.sqft || null,
       lotSize: comp.lotSize || comp.lotAreaValue || null,
       yearBuilt: comp.yearBuilt || null,
       propertyType: comp.homeType || comp.propertyType || null,
@@ -921,13 +939,22 @@ async function findComps(address, daysBack, env) {
     subject: subject,
     comps: scoredComps,
     compCount: scoredComps.length,
-    totalSearchResults: soldArr.length,
+    totalExtracted: extractedProperties.length,
+    zpidsFetched: zpidsToFetch.length,
+    fullDataCount: fullDataProps.length,
     daysBack: daysBack || 90,
     suggestedARV: avgARV,
     medianARV: medianARV,
     arvCompsUsed: arvComps.length,
     zestimate: subject.zestimate,
     generatedAt: new Date().toISOString(),
+    _debug: {
+      topLevelKeys: Object.keys(propertyData || {}),
+      extractedRaw: extractedProperties.length,
+      zpidsFetchedCount: Math.min(zpidsToFetch.length, 10),
+      fullDataAfterFetch: fullDataProps.length,
+      filteredOut: fullDataProps.length - scoredComps.length,
+    },
   };
 }
 
@@ -1038,15 +1065,6 @@ export default {
 
       // ---- Zillow API Routes ----
 
-      if (pathname === '/api/zillow/search') {
-        const location = url.searchParams.get('location') || url.searchParams.get('address');
-        const status = url.searchParams.get('status') || 'recentlySold';
-        if (!location) return errorResponse('location parameter required');
-        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
-        const data = await zillowSearch(location, status, env);
-        return jsonResponse(data);
-      }
-
       if (pathname === '/api/zillow/property') {
         const address = url.searchParams.get('address');
         const zpid = url.searchParams.get('zpid');
@@ -1064,6 +1082,37 @@ export default {
         const data = await findComps(address, days, env);
         if (data.error) return errorResponse(data.error, 400);
         return jsonResponse(data);
+      }
+
+      // Debug endpoint: raw API response so you can see exactly what ZLLW returns
+      if (pathname === '/api/zillow/raw') {
+        const address = url.searchParams.get('address');
+        const zpid = url.searchParams.get('zpid');
+        if (!address && !zpid) return errorResponse('address or zpid parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        const data = zpid ? await zillowGetByZpid(zpid, env) : await zillowGetByAddress(address, env);
+        // Return the completely raw response with key analysis
+        const allKeys = data ? Object.keys(data) : [];
+        const arrayKeys = allKeys.filter(k => Array.isArray(data[k]));
+        const objectKeys = allKeys.filter(k => data[k] && typeof data[k] === 'object' && !Array.isArray(data[k]));
+        const extracted = deepExtractProperties(data, 0, 6, null);
+        return jsonResponse({
+          _analysis: {
+            topLevelKeyCount: allKeys.length,
+            topLevelKeys: allKeys,
+            arrayKeys: arrayKeys,
+            objectKeys: objectKeys,
+            extractedPropertyCount: extracted.length,
+            extractedSample: extracted.slice(0, 3).map(e => ({
+              address: e.address || e.streetAddress || '?',
+              zpid: e.zpid,
+              price: e.price || e.soldPrice || e.lastSoldPrice,
+              beds: e.bedrooms || e.beds,
+              sqft: e.livingArea || e.sqft,
+            })),
+          },
+          raw: data,
+        });
       }
 
       if (pathname === '/api/zillow/lookup') {
