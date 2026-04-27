@@ -880,6 +880,27 @@ async function findComps(address, daysBack, env) {
     });
   }
 
+  // Extract last sale price and date from various Zillow fields
+  let lastSalePrice = p.lastSoldPrice || p.lastSalePrice || p.soldPrice || p.salePrice || null;
+  let lastSaleDate = p.dateSold || p.lastSoldDate || p.dateSoldString || null;
+
+  // Check priceHistory for the most recent sale event
+  if (Array.isArray(p.priceHistory) && p.priceHistory.length > 0) {
+    const saleEvents = p.priceHistory.filter(e => e.event && (e.event.toLowerCase() === 'sold' || e.event.toLowerCase().includes('sold')));
+    if (saleEvents.length > 0) {
+      // Sort by date descending
+      saleEvents.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+      if (!lastSalePrice && saleEvents[0].price) lastSalePrice = saleEvents[0].price;
+      if (!lastSaleDate && saleEvents[0].date) lastSaleDate = saleEvents[0].date;
+    }
+  }
+
+  // Also check taxHistory as a fallback
+  if (!lastSalePrice && Array.isArray(p.taxHistory) && p.taxHistory.length > 0) {
+    const withValue = p.taxHistory.filter(t => t.taxPaid || t.value);
+    // taxHistory doesn't always have sale prices, but can give clues
+  }
+
   const subject = {
     zpid: p.zpid,
     address: p.address || p.streetAddress || address,
@@ -898,6 +919,8 @@ async function findComps(address, daysBack, env) {
     state: p.state || null,
     imgSrc: p.imgSrc || p.streetViewTileImageUrlMediumAddress || (subjectPhotos.length > 0 ? subjectPhotos[0] : null),
     photos: subjectPhotos.slice(0, 30),
+    lastSalePrice: lastSalePrice || null,
+    lastSaleDate: lastSaleDate || null,
   };
 
   // Step 2: Deep-extract all property-like objects from the response
