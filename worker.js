@@ -509,32 +509,56 @@ function deepExtractAgents(obj, depth, maxDepth) {
 
   function extractAgentFromItem(item) {
     const agents = [];
+
+    // Helper: find any phone-like value across many possible field names
+    function findPhone(...sources) {
+      for (const s of sources) {
+        if (s && typeof s === 'string' && s.length >= 7) return s;
+        if (s && typeof s === 'number') return String(s);
+      }
+      return null;
+    }
+
     // Check common Zillow agent fields
     const attrInfo = item.attributionInfo || {};
     if (attrInfo.agentName || attrInfo.brokerName) {
       agents.push({
         agentName: attrInfo.agentName || null,
-        agentPhone: attrInfo.agentPhoneNumber || null,
+        agentPhone: findPhone(attrInfo.agentPhoneNumber, attrInfo.agentPhone, attrInfo.phone, attrInfo.listAgentPhone),
         brokerName: attrInfo.brokerName || null,
-        brokerPhone: attrInfo.brokerPhoneNumber || null,
+        brokerPhone: findPhone(attrInfo.brokerPhoneNumber, attrInfo.brokerPhone),
         mlsId: attrInfo.mlsId || null,
       });
     }
     if (item.listingAgent && (item.listingAgent.name || item.listingAgent.agentName)) {
+      const la = item.listingAgent;
       agents.push({
-        agentName: item.listingAgent.name || item.listingAgent.agentName || null,
-        agentPhone: item.listingAgent.phone || item.listingAgent.phoneNumber || null,
-        brokerName: item.listingAgent.brokerageName || item.brokerageName || null,
-        brokerPhone: null,
-        mlsId: item.listingAgent.mlsId || null,
+        agentName: la.name || la.agentName || null,
+        agentPhone: findPhone(la.phone, la.phoneNumber, la.agentPhone, la.cellPhone, la.officePhone, la.directPhone),
+        brokerName: la.brokerageName || la.officeName || item.brokerageName || null,
+        brokerPhone: findPhone(la.officePhoneNumber, la.brokerPhone),
+        mlsId: la.mlsId || null,
       });
     }
+    // Check buyerAgent / sellerAgent / coAgent too
+    ['buyerAgent', 'sellerAgent', 'coAgent'].forEach(role => {
+      const ag = item[role];
+      if (ag && (ag.name || ag.agentName)) {
+        agents.push({
+          agentName: ag.name || ag.agentName || null,
+          agentPhone: findPhone(ag.phone, ag.phoneNumber, ag.cellPhone, ag.directPhone, ag.officePhone),
+          brokerName: ag.brokerageName || ag.officeName || null,
+          brokerPhone: null,
+          mlsId: ag.mlsId || null,
+        });
+      }
+    });
     if (item.agentName || item.listingAgentName) {
       agents.push({
         agentName: item.agentName || item.listingAgentName || null,
-        agentPhone: item.agentPhone || item.listingAgentPhone || null,
-        brokerName: item.brokerageName || item.brokerName || null,
-        brokerPhone: null,
+        agentPhone: findPhone(item.agentPhone, item.listingAgentPhone, item.agentPhoneNumber, item.phone, item.contactPhone),
+        brokerName: item.brokerageName || item.brokerName || item.officeName || null,
+        brokerPhone: findPhone(item.brokerPhone, item.officePhone),
         mlsId: null,
       });
     }
