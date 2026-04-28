@@ -1332,14 +1332,13 @@ async function findComps(address, daysBack, env) {
     const compStatus = (comp.homeStatus || comp.statusType || comp.listingStatus || comp.status || '').toString().toLowerCase();
     if (compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent') return;
 
-    // ONLY use actual sold or pending sale prices — never Zestimate, listing, or generic price
+    // Priority 1: Explicit sold price fields
     let price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
     let priceSource = comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : comp.lastSalePrice ? 'lastSalePrice' : null;
 
-    // Non-disclosure state fallback: check priceHistory for sold or pending sale price ONLY
+    // Priority 2: priceHistory — sold event price, then pending sale price
     if (price <= 0 && Array.isArray(comp.priceHistory) && comp.priceHistory.length > 0) {
       const sorted = [...comp.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-      // First pass: look for a Sold event with a price
       for (let hi = 0; hi < sorted.length; hi++) {
         const evtType = (sorted[hi].event || '').toLowerCase();
         if ((evtType === 'sold' || evtType.includes('sold')) && sorted[hi].price) {
@@ -1348,7 +1347,6 @@ async function findComps(address, daysBack, env) {
           break;
         }
       }
-      // Second pass: if sold had no price (non-disclosure), grab the pending sale price
       if (price <= 0) {
         for (let hi = 0; hi < sorted.length; hi++) {
           const evtType = (sorted[hi].event || '').toLowerCase();
@@ -1360,6 +1358,23 @@ async function findComps(address, daysBack, env) {
         }
       }
     }
+
+    // Priority 3: If status indicates recently sold / other (NOT active listing or rental),
+    // accept generic price as probable sale price. In non-disclosure states the API often
+    // only provides price (no soldPrice, no priceHistory) for recently sold nearby properties.
+    if (price <= 0 && (comp.price || comp.salePrice)) {
+      const statusLower = compStatus;
+      const isActiveListing = statusLower.includes('for_sale') || statusLower.includes('coming_soon')
+        || statusLower.includes('new_listing') || statusLower.includes('active');
+      const isRental = statusLower.includes('for_rent') || statusLower.includes('rental') || statusLower === 'rent';
+
+      if (!isActiveListing && !isRental) {
+        // Status is OTHER, RECENTLY_SOLD, SOLD, PENDING, or empty — accept as probable sold price
+        price = comp.salePrice || comp.price;
+        priceSource = 'price:' + (compStatus || 'inferred');
+      }
+    }
+
     if (price <= 0) return;
 
     // Skip if price looks like a monthly rent (under $10k and no sold date)
@@ -1437,6 +1452,7 @@ async function findComps(address, daysBack, env) {
       fullDataAfterFetch: fullDataProps.length,
       fullDataWithPriceHistory: fullDataProps.filter(f => Array.isArray(f.priceHistory) && f.priceHistory.length > 0).length,
       filteredOut: fullDataProps.length - scoredComps.length,
+      compPriceSources: scoredComps.reduce((acc, c) => { acc[c._priceSource] = (acc[c._priceSource] || 0) + 1; return acc; }, {}),
       // Sample of what's in extracted (first 3) for debugging
       extractedSample: extractedProperties.slice(0, 3).map(e => ({
         zpid: e.zpid || null,
