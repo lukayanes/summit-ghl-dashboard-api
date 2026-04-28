@@ -503,12 +503,12 @@ async function rentometerSummary(address, bedrooms, env) {
  * Recursively scans for agent/broker info (attributionInfo, listingAgent, brokerageName, etc.)
  * Used to find active investor-friendly listing agents near a subject property.
  */
+// Regex to detect phone numbers in values (US format) — shared across agent functions
+const phoneRegex = /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/;
+
 function deepExtractAgents(obj, depth, maxDepth) {
   if (!obj || depth > maxDepth) return [];
   const results = [];
-
-  // Regex to detect phone numbers in values (US format)
-  const phoneRegex = /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/;
 
   // Brute-force scan an object for phone-like string values
   function findPhonesInObj(obj, maxDepth = 3, depth = 0) {
