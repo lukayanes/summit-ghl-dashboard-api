@@ -507,61 +507,141 @@ function deepExtractAgents(obj, depth, maxDepth) {
   if (!obj || depth > maxDepth) return [];
   const results = [];
 
+  // Regex to detect phone numbers in values (US format)
+  const phoneRegex = /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/;
+
+  // Brute-force scan an object for phone-like string values
+  function findPhonesInObj(obj, maxDepth = 3, depth = 0) {
+    const phones = [];
+    if (!obj || depth > maxDepth) return phones;
+    if (typeof obj === 'string') {
+      const m = obj.match(phoneRegex);
+      if (m) phones.push(m[0]);
+      return phones;
+    }
+    if (typeof obj === 'number' && String(obj).length >= 10) {
+      phones.push(String(obj));
+      return phones;
+    }
+    if (Array.isArray(obj)) {
+      obj.forEach(v => phones.push(...findPhonesInObj(v, maxDepth, depth + 1)));
+    } else if (typeof obj === 'object') {
+      for (const [key, val] of Object.entries(obj)) {
+        const k = key.toLowerCase();
+        // Prioritize keys that look phone-related
+        if (k.includes('phone') || k.includes('cell') || k.includes('mobile') || k.includes('tel') || k.includes('contact')) {
+          if (typeof val === 'string' && val.match(phoneRegex)) phones.unshift(val.match(phoneRegex)[0]);
+          else if (typeof val === 'number' && String(val).length >= 10) phones.unshift(String(val));
+        } else {
+          phones.push(...findPhonesInObj(val, maxDepth, depth + 1));
+        }
+      }
+    }
+    return phones;
+  }
+
+  // Find any phone from many possible sources
+  function findPhone(...sources) {
+    for (const s of sources) {
+      if (s && typeof s === 'string' && s.length >= 7) return s;
+      if (s && typeof s === 'number' && String(s).length >= 10) return String(s);
+    }
+    return null;
+  }
+
+  // Find agent name from an object (checks many field names)
+  function findAgentName(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    return obj.agentName || obj.name || obj.agent_name || obj.display_name
+      || obj.listAgentName || obj.listingAgentName || obj.buyerAgentName
+      || obj.sellerAgentName || obj.coAgentName || null;
+  }
+
   function extractAgentFromItem(item) {
     const agents = [];
 
-    // Helper: find any phone-like value across many possible field names
-    function findPhone(...sources) {
-      for (const s of sources) {
-        if (s && typeof s === 'string' && s.length >= 7) return s;
-        if (s && typeof s === 'number') return String(s);
-      }
-      return null;
-    }
-
-    // Check common Zillow agent fields
+    // Check attributionInfo
     const attrInfo = item.attributionInfo || {};
     if (attrInfo.agentName || attrInfo.brokerName) {
+      const phonesInAttr = findPhonesInObj(attrInfo);
       agents.push({
         agentName: attrInfo.agentName || null,
-        agentPhone: findPhone(attrInfo.agentPhoneNumber, attrInfo.agentPhone, attrInfo.phone, attrInfo.listAgentPhone),
+        agentPhone: findPhone(attrInfo.agentPhoneNumber, attrInfo.agentPhone, attrInfo.phone, attrInfo.listAgentPhone) || phonesInAttr[0] || null,
         brokerName: attrInfo.brokerName || null,
-        brokerPhone: findPhone(attrInfo.brokerPhoneNumber, attrInfo.brokerPhone),
+        brokerPhone: findPhone(attrInfo.brokerPhoneNumber, attrInfo.brokerPhone) || phonesInAttr[1] || null,
         mlsId: attrInfo.mlsId || null,
       });
     }
+
+    // Check listingAgent object
     if (item.listingAgent && (item.listingAgent.name || item.listingAgent.agentName)) {
       const la = item.listingAgent;
+      const phonesInLA = findPhonesInObj(la);
       agents.push({
         agentName: la.name || la.agentName || null,
-        agentPhone: findPhone(la.phone, la.phoneNumber, la.agentPhone, la.cellPhone, la.officePhone, la.directPhone),
+        agentPhone: findPhone(la.phone, la.phoneNumber, la.agentPhone, la.cellPhone, la.officePhone, la.directPhone) || phonesInLA[0] || null,
         brokerName: la.brokerageName || la.officeName || item.brokerageName || null,
-        brokerPhone: findPhone(la.officePhoneNumber, la.brokerPhone),
+        brokerPhone: findPhone(la.officePhoneNumber, la.brokerPhone) || phonesInLA[1] || null,
         mlsId: la.mlsId || null,
       });
     }
-    // Check buyerAgent / sellerAgent / coAgent too
-    ['buyerAgent', 'sellerAgent', 'coAgent'].forEach(role => {
+
+    // Check role-based agents
+    ['buyerAgent', 'sellerAgent', 'coAgent', 'listAgent', 'listing_agent', 'seller_agent'].forEach(role => {
       const ag = item[role];
-      if (ag && (ag.name || ag.agentName)) {
+      if (ag && typeof ag === 'object' && findAgentName(ag)) {
+        const phonesInAg = findPhonesInObj(ag);
         agents.push({
-          agentName: ag.name || ag.agentName || null,
-          agentPhone: findPhone(ag.phone, ag.phoneNumber, ag.cellPhone, ag.directPhone, ag.officePhone),
+          agentName: findAgentName(ag),
+          agentPhone: findPhone(ag.phone, ag.phoneNumber, ag.cellPhone, ag.directPhone, ag.officePhone) || phonesInAg[0] || null,
           brokerName: ag.brokerageName || ag.officeName || null,
           brokerPhone: null,
           mlsId: ag.mlsId || null,
         });
       }
     });
-    if (item.agentName || item.listingAgentName) {
+
+    // Check contactRecipients (Zillow often puts agent contact info here)
+    if (Array.isArray(item.contactRecipients)) {
+      item.contactRecipients.forEach(cr => {
+        if (cr && (cr.agentName || cr.name || cr.agent_name)) {
+          const phonesInCR = findPhonesInObj(cr);
+          agents.push({
+            agentName: cr.agentName || cr.name || cr.agent_name || null,
+            agentPhone: findPhone(cr.phone, cr.phoneNumber, cr.agentPhone) || phonesInCR[0] || null,
+            brokerName: cr.brokerageName || cr.badgeType || null,
+            brokerPhone: null,
+            mlsId: null,
+          });
+        }
+      });
+    }
+
+    // Check listingProvider
+    if (item.listingProvider && (item.listingProvider.agentName || item.listingProvider.name)) {
+      const lp = item.listingProvider;
+      const phonesInLP = findPhonesInObj(lp);
       agents.push({
-        agentName: item.agentName || item.listingAgentName || null,
-        agentPhone: findPhone(item.agentPhone, item.listingAgentPhone, item.agentPhoneNumber, item.phone, item.contactPhone),
-        brokerName: item.brokerageName || item.brokerName || item.officeName || null,
-        brokerPhone: findPhone(item.brokerPhone, item.officePhone),
+        agentName: lp.agentName || lp.name || null,
+        agentPhone: findPhone(lp.phone, lp.phoneNumber) || phonesInLP[0] || null,
+        brokerName: lp.title || lp.brokerageName || null,
+        brokerPhone: null,
         mlsId: null,
       });
     }
+
+    // Flat field fallback
+    if (item.agentName || item.listingAgentName || item.listAgentName) {
+      const phonesFlat = findPhonesInObj(item, 1); // shallow scan
+      agents.push({
+        agentName: item.agentName || item.listingAgentName || item.listAgentName || null,
+        agentPhone: findPhone(item.agentPhone, item.listingAgentPhone, item.listAgentPhone, item.agentPhoneNumber, item.phone, item.contactPhone) || phonesFlat[0] || null,
+        brokerName: item.brokerageName || item.brokerName || item.officeName || null,
+        brokerPhone: findPhone(item.brokerPhone, item.officePhone) || null,
+        mlsId: null,
+      });
+    }
+
     return agents;
   }
 
@@ -680,12 +760,40 @@ async function findListingAgents(address, env) {
     return b.listingCount - a.listingCount;
   });
 
+  // Debug: scan entire response for any phone-containing keys
+  const phoneKeyFinds = [];
+  function scanForPhoneKeys(obj, path, depth) {
+    if (!obj || depth > 6) return;
+    if (typeof obj === 'string' && phoneRegex.test(obj)) {
+      phoneKeyFinds.push({ path, value: obj.substring(0, 50) });
+      return;
+    }
+    if (typeof obj === 'number' && String(obj).length >= 10 && String(obj).length <= 12) {
+      phoneKeyFinds.push({ path, value: String(obj) });
+      return;
+    }
+    if (Array.isArray(obj)) {
+      obj.slice(0, 5).forEach((v, i) => scanForPhoneKeys(v, path + '[' + i + ']', depth + 1));
+    } else if (typeof obj === 'object') {
+      for (const [k, v] of Object.entries(obj)) {
+        scanForPhoneKeys(v, path + '.' + k, depth + 1);
+      }
+    }
+  }
+  scanForPhoneKeys(propertyData, 'root', 0);
+
   return {
     agents: agents.slice(0, 20),
     totalAgentsFound: agents.length,
     medianAreaPrice: medianPrice,
     totalListingsScanned: allPrices.length,
     subjectAddress: address,
+    _debug: {
+      rawAgentsExtracted: rawAgents.length,
+      agentsWithPhone: rawAgents.filter(a => a.agentPhone).length,
+      agentsWithBrokerPhone: rawAgents.filter(a => a.brokerPhone).length,
+      phoneKeysFoundInResponse: phoneKeyFinds.slice(0, 30),
+    },
   };
 }
 
