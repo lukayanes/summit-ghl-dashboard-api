@@ -1128,9 +1128,26 @@ async function findComps(address, daysBack, env) {
     _debug: {
       topLevelKeys: Object.keys(propertyData || {}),
       extractedRaw: extractedProperties.length,
-      zpidsFetchedCount: Math.min(zpidsToFetch.length, 10),
+      extractedWithZpid: extractedProperties.filter(e => e.zpid).length,
+      extractedWithSoldPrice: extractedProperties.filter(e => e.soldPrice || e.lastSoldPrice || e.lastSalePrice).length,
+      extractedWithPriceHistory: extractedProperties.filter(e => Array.isArray(e.priceHistory) && e.priceHistory.length > 0).length,
+      extractedWithGenericPrice: extractedProperties.filter(e => e.price && !e.soldPrice && !e.lastSoldPrice && !e.lastSalePrice).length,
+      zpidsQueuedForFetch: zpidsToFetch.length,
+      zpidsFetchedCount: Math.min(zpidsToFetch.length, 15),
+      directToFullData: fullDataProps.length - Math.min(zpidsToFetch.length, 15),
       fullDataAfterFetch: fullDataProps.length,
+      fullDataWithPriceHistory: fullDataProps.filter(f => Array.isArray(f.priceHistory) && f.priceHistory.length > 0).length,
       filteredOut: fullDataProps.length - scoredComps.length,
+      // Sample of what's in extracted (first 3) for debugging
+      extractedSample: extractedProperties.slice(0, 3).map(e => ({
+        zpid: e.zpid || null,
+        address: (e.address || e.streetAddress || '').toString().substring(0, 50),
+        soldPrice: e.soldPrice || null,
+        lastSoldPrice: e.lastSoldPrice || null,
+        price: e.price || null,
+        homeStatus: e.homeStatus || e.statusType || null,
+        hasPriceHistory: Array.isArray(e.priceHistory) && e.priceHistory.length > 0,
+      })),
     },
   };
 }
