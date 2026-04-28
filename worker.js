@@ -499,6 +499,173 @@ async function rentometerSummary(address, bedrooms, env) {
 }
 
 /**
+ * Extract listing agents from Zillow property data.
+ * Recursively scans for agent/broker info (attributionInfo, listingAgent, brokerageName, etc.)
+ * Used to find active investor-friendly listing agents near a subject property.
+ */
+function deepExtractAgents(obj, depth, maxDepth) {
+  if (!obj || depth > maxDepth) return [];
+  const results = [];
+
+  function extractAgentFromItem(item) {
+    const agents = [];
+    // Check common Zillow agent fields
+    const attrInfo = item.attributionInfo || {};
+    if (attrInfo.agentName || attrInfo.brokerName) {
+      agents.push({
+        agentName: attrInfo.agentName || null,
+        agentPhone: attrInfo.agentPhoneNumber || null,
+        brokerName: attrInfo.brokerName || null,
+        brokerPhone: attrInfo.brokerPhoneNumber || null,
+        mlsId: attrInfo.mlsId || null,
+      });
+    }
+    if (item.listingAgent && (item.listingAgent.name || item.listingAgent.agentName)) {
+      agents.push({
+        agentName: item.listingAgent.name || item.listingAgent.agentName || null,
+        agentPhone: item.listingAgent.phone || item.listingAgent.phoneNumber || null,
+        brokerName: item.listingAgent.brokerageName || item.brokerageName || null,
+        brokerPhone: null,
+        mlsId: item.listingAgent.mlsId || null,
+      });
+    }
+    if (item.agentName || item.listingAgentName) {
+      agents.push({
+        agentName: item.agentName || item.listingAgentName || null,
+        agentPhone: item.agentPhone || item.listingAgentPhone || null,
+        brokerName: item.brokerageName || item.brokerName || null,
+        brokerPhone: null,
+        mlsId: null,
+      });
+    }
+    return agents;
+  }
+
+  if (Array.isArray(obj)) {
+    obj.forEach(item => {
+      if (item && typeof item === 'object') {
+        const agents = extractAgentFromItem(item);
+        agents.forEach(a => {
+          if (a.agentName) {
+            // Attach property context
+            a.propertyAddress = item.address || item.streetAddress || item.formattedAddress || '';
+            if (typeof a.propertyAddress === 'object') a.propertyAddress = (a.propertyAddress.streetAddress || '') + ', ' + (a.propertyAddress.city || '');
+            a.listPrice = item.price || item.listPrice || null;
+            a.homeStatus = item.homeStatus || item.statusType || item.listingStatus || '';
+            a.zpid = item.zpid || null;
+            a.bedrooms = item.bedrooms || item.beds || null;
+            a.bathrooms = item.bathrooms || item.baths || null;
+            a.livingArea = item.livingArea || item.sqft || null;
+            results.push(a);
+          }
+        });
+        results.push(...deepExtractAgents(item, depth + 1, maxDepth));
+      }
+    });
+  } else if (typeof obj === 'object') {
+    const agents = extractAgentFromItem(obj);
+    agents.forEach(a => {
+      if (a.agentName) {
+        a.propertyAddress = obj.address || obj.streetAddress || '';
+        if (typeof a.propertyAddress === 'object') a.propertyAddress = (a.propertyAddress.streetAddress || '') + ', ' + (a.propertyAddress.city || '');
+        a.listPrice = obj.price || obj.listPrice || null;
+        a.homeStatus = obj.homeStatus || obj.statusType || '';
+        a.zpid = obj.zpid || null;
+        a.bedrooms = obj.bedrooms || obj.beds || null;
+        a.bathrooms = obj.bathrooms || obj.baths || null;
+        a.livingArea = obj.livingArea || obj.sqft || null;
+        results.push(a);
+      }
+    });
+    Object.values(obj).forEach(val => {
+      if (val && typeof val === 'object') {
+        results.push(...deepExtractAgents(val, depth + 1, maxDepth));
+      }
+    });
+  }
+  return results;
+}
+
+/**
+ * Find active listing agents near a property — focused on investor-price-range listings.
+ * Fetches property data, extracts all agent info, deduplicates by agent name,
+ * and returns agents sorted by number of listings (most active first).
+ */
+async function findListingAgents(address, env) {
+  const propertyData = await zillowGetByAddress(address, env);
+  const p = propertyData?.propertyDetails || propertyData?.data || propertyData || {};
+
+  // Extract all agents from the full response tree
+  const rawAgents = deepExtractAgents(propertyData, 0, 6);
+
+  // Deduplicate by agent name, track their listings
+  const agentMap = {};
+  rawAgents.forEach(a => {
+    if (!a.agentName) return;
+    const key = a.agentName.toLowerCase().trim();
+    if (!agentMap[key]) {
+      agentMap[key] = {
+        agentName: a.agentName,
+        agentPhone: a.agentPhone,
+        brokerName: a.brokerName,
+        brokerPhone: a.brokerPhone,
+        listings: [],
+      };
+    }
+    // Update phone if we didn't have it
+    if (!agentMap[key].agentPhone && a.agentPhone) agentMap[key].agentPhone = a.agentPhone;
+    if (!agentMap[key].brokerName && a.brokerName) agentMap[key].brokerName = a.brokerName;
+    // Add listing
+    if (a.propertyAddress && a.listPrice) {
+      const alreadyHas = agentMap[key].listings.some(l => l.zpid === a.zpid && a.zpid);
+      if (!alreadyHas) {
+        agentMap[key].listings.push({
+          address: a.propertyAddress,
+          price: a.listPrice,
+          status: a.homeStatus,
+          zpid: a.zpid,
+          beds: a.bedrooms,
+          baths: a.bathrooms,
+          sqft: a.livingArea,
+        });
+      }
+    }
+  });
+
+  // Convert to array, sort by listing count (most active first)
+  let agents = Object.values(agentMap);
+  agents.sort((a, b) => b.listings.length - a.listings.length);
+
+  // Focus on lower-price-range agents (investor-friendly)
+  // Calculate median price of all listings to establish "investor range"
+  const allPrices = agents.flatMap(a => a.listings.map(l => l.price)).filter(p => p > 0).sort((a, b) => a - b);
+  const medianPrice = allPrices.length > 0 ? allPrices[Math.floor(allPrices.length / 2)] : 0;
+  // Tag each agent with their avg price and whether they list investor-range properties
+  agents.forEach(a => {
+    const prices = a.listings.map(l => l.price).filter(p => p > 0);
+    a.avgListPrice = prices.length > 0 ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : 0;
+    a.listingCount = a.listings.length;
+    // "Investor-friendly" = avg list price is at or below median for the area
+    a.investorFriendly = a.avgListPrice > 0 && a.avgListPrice <= medianPrice;
+  });
+
+  // Sort: investor-friendly first, then by listing count
+  agents.sort((a, b) => {
+    if (a.investorFriendly && !b.investorFriendly) return -1;
+    if (!a.investorFriendly && b.investorFriendly) return 1;
+    return b.listingCount - a.listingCount;
+  });
+
+  return {
+    agents: agents.slice(0, 20),
+    totalAgentsFound: agents.length,
+    medianAreaPrice: medianPrice,
+    totalListingsScanned: allPrices.length,
+    subjectAddress: address,
+  };
+}
+
+/**
  * Deep-extract all property-like objects from a Zillow API response.
  * Searches recursively for arrays/objects that look like property records
  * (have address/zpid/price fields). Used to find embedded comps, nearby sales, etc.
@@ -1358,6 +1525,19 @@ export default {
         if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
         const data = await zillowFullLookup(address, env);
         return jsonResponse(data);
+      }
+
+      // Find active listing agents near a property (investor-friendly focus)
+      if (pathname === '/api/zillow/listing-agents') {
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
+        try {
+          const data = await findListingAgents(address, env);
+          return jsonResponse(data);
+        } catch (e) {
+          return errorResponse('Failed to find listing agents: ' + e.message);
+        }
       }
 
       // ---- Rentometer API Routes ----
