@@ -1009,7 +1009,7 @@ async function zillowFullLookup(address, env) {
     if (cZpid && seenCompZpids.has(cZpid)) return;
     if (cZpid) seenCompZpids.add(cZpid);
     comps.push({
-      address: comp.address || comp.streetAddress || comp.formattedAddress || '',
+      address: (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') : null) || comp.streetAddress || comp.formattedAddress || comp.address || '',
       price: comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || comp.price || 0,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
@@ -1341,13 +1341,14 @@ async function findComps(address, daysBack, env) {
     }
   });
 
-  // Step 3: Collect ALL zpids to fetch individually
+  // Step 3: Fetch ALL zpids individually for full property data
   // KEY INSIGHT: In non-disclosure states (TX), embedded property stubs only have
   // Zestimates. The individual /pro/byzpid lookup returns priceHistory with actual
   // pending/sold prices. So we fetch ALL zpids, not just ones without prices.
   const zpidsToFetch = [];
   const fullDataProps = [];
   const seenFetchZpids = new Set();
+  const stubsByZpid = new Map(); // Keep stubs as fallback if fetch fails
 
   allExtracted.forEach(ep => {
     const hasSoldPrice = ep.soldPrice || ep.lastSoldPrice || ep.lastSalePrice;
@@ -1358,34 +1359,83 @@ async function findComps(address, daysBack, env) {
       // Has everything — use as-is (no need to refetch)
       fullDataProps.push(ep);
     } else if (ep.zpid && !seenFetchZpids.has(ep.zpid)) {
-      // Fetch individually to get priceHistory + full details
+      // Queue for individual fetch to get priceHistory + full details
       zpidsToFetch.push(ep.zpid);
       seenFetchZpids.add(ep.zpid);
+      // Save the stub so we can fall back to it if the fetch fails
+      stubsByZpid.set(String(ep.zpid), ep);
     } else if (!ep.zpid && hasSoldPrice && hasBasicData) {
-      // No zpid but has good data — keep it
       fullDataProps.push(ep);
     }
   });
 
-  // Fetch up to 25 zpids individually (raised from 15 for better coverage)
-  // Batch in groups of 5 to avoid overwhelming the API
+  // Fetch zpids individually with retry logic
+  // Batch in groups of 3 (smaller batches = less rate limiting)
+  // Retry failed fetches once with a delay
   const maxFetch = 25;
+  const fetchedZpids = new Set(); // track which zpids we successfully fetched
+
   if (zpidsToFetch.length > 0) {
     const toFetch = zpidsToFetch.slice(0, maxFetch);
-    const batchSize = 5;
+    const batchSize = 3;
+    const failedZpids = [];
+
     for (let i = 0; i < toFetch.length; i += batchSize) {
       const batch = toFetch.slice(i, i + batchSize);
       const fetched = await Promise.allSettled(
         batch.map(zpid => zillowGetByZpid(zpid, env))
       );
-      fetched.forEach(result => {
+      fetched.forEach((result, idx) => {
+        const zpid = batch[idx];
         if (result.status === 'fulfilled' && result.value) {
           const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
           if (fd.zpid || fd.address || fd.streetAddress) {
             fullDataProps.push(fd);
+            fetchedZpids.add(String(zpid));
+          } else {
+            failedZpids.push(zpid);
           }
+        } else {
+          failedZpids.push(zpid);
         }
       });
+      // Small delay between batches to avoid rate limiting
+      if (i + batchSize < toFetch.length) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    // Retry failed fetches once with a delay
+    if (failedZpids.length > 0) {
+      await new Promise(r => setTimeout(r, 1000));
+      for (let i = 0; i < failedZpids.length; i += batchSize) {
+        const batch = failedZpids.slice(i, i + batchSize);
+        const retried = await Promise.allSettled(
+          batch.map(zpid => zillowGetByZpid(zpid, env))
+        );
+        retried.forEach((result, idx) => {
+          const zpid = batch[idx];
+          if (result.status === 'fulfilled' && result.value) {
+            const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
+            if (fd.zpid || fd.address || fd.streetAddress) {
+              fullDataProps.push(fd);
+              fetchedZpids.add(String(zpid));
+            }
+          }
+        });
+        if (i + batchSize < failedZpids.length) {
+          await new Promise(r => setTimeout(r, 300));
+        }
+      }
+    }
+
+    // For any zpids that STILL failed to fetch, use the original stub data as fallback
+    // This ensures we at least show properties with Zestimate prices (labeled accordingly)
+    // rather than losing them entirely
+    for (const [zpidStr, stub] of stubsByZpid.entries()) {
+      if (!fetchedZpids.has(zpidStr)) {
+        fullDataProps.push(stub);
+      }
     }
   }
 
@@ -1449,11 +1499,19 @@ async function findComps(address, daysBack, env) {
     // Skip if price looks like a monthly rent
     if (price < 10000 && !soldDateStr) return;
 
-    // ZESTIMATE DETECTION: If the price exactly matches the Zestimate and we have
-    // no sold date and no priceHistory sale event, this is just a Zestimate — skip it
-    const isLikelyZestimate = comp.zestimate && price === comp.zestimate && !soldDateStr
+    // Skip active for-sale listings (we want sold/pending/recently sold comps)
+    const isActiveListing2 = compStatus.includes('for_sale') || compStatus.includes('coming_soon')
+      || compStatus.includes('new_listing');
+    if (isActiveListing2 && !soldDateStr) return;
+
+    // ZESTIMATE DETECTION: Flag likely Zestimates but DON'T filter them out —
+    // in non-disclosure states (TX) these may be the only data available.
+    // Instead, label them and heavily penalize their match score.
+    const isLikelyZestimate = comp.zestimate && Math.abs(price - comp.zestimate) < 100 && !soldDateStr
       && (!priceSource || priceSource.startsWith('price:'));
-    if (isLikelyZestimate) return;
+    if (isLikelyZestimate) {
+      priceSource = 'zestimate';
+    }
 
     // Date filter — allow wider window for non-disclosure states
     if (soldDateStr) {
@@ -1471,18 +1529,24 @@ async function findComps(address, daysBack, env) {
     comp._distance = distance;
     const scoring = scoreComp(subject, comp);
 
-    // Bonus: deprioritize comps that only have generic price (likely Zestimate)
+    // Adjust match score based on price source quality
     let adjustedMatchPct = scoring.matchPct;
-    if (priceSource && priceSource.startsWith('price:')) {
-      adjustedMatchPct = Math.max(0, adjustedMatchPct - 10); // small penalty for uncertain price source
+
+    // Heavy penalty for Zestimate-only prices (not real sale data)
+    if (priceSource === 'zestimate') {
+      adjustedMatchPct = Math.max(0, adjustedMatchPct - 20);
     }
-    // Bonus: boost comps with verified sale prices
+    // Moderate penalty for generic price with unknown source
+    else if (priceSource && priceSource.startsWith('price:')) {
+      adjustedMatchPct = Math.max(0, adjustedMatchPct - 10);
+    }
+    // Boost for verified sale prices
     if (priceSource && (priceSource.includes('sold') || priceSource.includes('pending_before_sold'))) {
       adjustedMatchPct = Math.min(100, adjustedMatchPct + 5);
     }
 
     scoredComps.push({
-      address: comp.address || comp.streetAddress || comp.formattedAddress || '',
+      address: (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') : null) || comp.streetAddress || comp.formattedAddress || comp.address || '',
       price: price,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
@@ -1550,7 +1614,9 @@ async function findComps(address, daysBack, env) {
       extractedWithPriceHistory: allExtracted.filter(e => Array.isArray(e.priceHistory) && e.priceHistory.length > 0).length,
       extractedWithGenericPrice: allExtracted.filter(e => e.price && !e.soldPrice && !e.lastSoldPrice && !e.lastSalePrice).length,
       zpidsQueuedForFetch: zpidsToFetch.length,
-      zpidsFetchedCount: Math.min(zpidsToFetch.length, maxFetch),
+      zpidsFetchedSuccessfully: fetchedZpids.size,
+      zpidsFetchFailed: zpidsToFetch.slice(0, maxFetch).length - fetchedZpids.size,
+      stubsUsedAsFallback: zpidsToFetch.slice(0, maxFetch).length - fetchedZpids.size,
       fullDataAfterFetch: fullDataProps.length,
       fullDataWithPriceHistory: fullDataProps.filter(f => Array.isArray(f.priceHistory) && f.priceHistory.length > 0).length,
       verifiedPriceComps: verifiedComps.length,
@@ -1558,7 +1624,7 @@ async function findComps(address, daysBack, env) {
       compPriceSources: scoredComps.reduce((acc, c) => { acc[c._priceSource] = (acc[c._priceSource] || 0) + 1; return acc; }, {}),
       extractedSample: allExtracted.slice(0, 5).map(e => ({
         zpid: e.zpid || null,
-        address: (e.address || e.streetAddress || '').toString().substring(0, 50),
+        address: (typeof e.address === 'object' ? JSON.stringify(e.address).substring(0, 50) : (e.address || e.streetAddress || '')).toString().substring(0, 50),
         soldPrice: e.soldPrice || null,
         lastSoldPrice: e.lastSoldPrice || null,
         price: e.price || null,
