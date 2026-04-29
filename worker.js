@@ -512,8 +512,9 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
   try {
     const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'text/csv,text/plain,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.redfin.com/',
       },
     });
@@ -524,13 +525,19 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
 
     const csvText = await response.text();
     if (!csvText || csvText.length < 50) {
-      return { error: 'Empty response from Redfin', properties: [] };
+      return { error: 'Empty response from Redfin (length: ' + (csvText || '').length + ')', properties: [] };
+    }
+
+    // Check if we got HTML instead of CSV (Redfin might return a CAPTCHA or error page)
+    const trimmedStart = csvText.substring(0, 100).trim().toLowerCase();
+    if (trimmedStart.startsWith('<!doctype') || trimmedStart.startsWith('<html') || trimmedStart.startsWith('{')) {
+      return { error: 'Redfin returned HTML/JSON instead of CSV (possible block)', properties: [] };
     }
 
     // Parse CSV
     const lines = csvText.split('\n').filter(l => l.trim());
     if (lines.length < 2) {
-      return { error: 'No data rows in Redfin CSV', properties: [] };
+      return { error: 'No data rows in Redfin CSV (lines: ' + lines.length + ')', properties: [] };
     }
 
     // Parse headers — Redfin CSV uses quoted headers
@@ -1442,7 +1449,9 @@ async function findComps(address, daysBack, env) {
 
   const subject = {
     zpid: p.zpid,
-    address: p.address || p.streetAddress || address,
+    address: (typeof p.address === 'object' && p.address
+      ? (p.address.streetAddress || p.address.street || '') + (p.address.city ? ', ' + p.address.city : '') + (p.address.state ? ', ' + p.address.state : '') + (p.address.zipcode ? ' ' + p.address.zipcode : '')
+      : (typeof p.address === 'string' ? p.address : null)) || p.streetAddress || address,
     bedrooms: p.bedrooms || p.beds || null,
     bathrooms: p.bathrooms || p.baths || null,
     livingArea: p.livingArea || p.livingAreaValue || p.sqft || null,
@@ -1520,8 +1529,8 @@ async function findComps(address, daysBack, env) {
   const seenAddresses = new Set();
   redfinProps.forEach(rp => {
     // Normalize address for dedup
-    const normAddr = (rp.streetAddress || rp.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const subjectNorm = (subject.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normAddr = String(rp.streetAddress || rp.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const subjectNorm = String(subject.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     if (normAddr === subjectNorm) return; // skip subject
     if (seenAddresses.has(normAddr)) return;
     seenAddresses.add(normAddr);
@@ -1572,7 +1581,7 @@ async function findComps(address, daysBack, env) {
     if (comp.zpid) seenZpids.add(String(comp.zpid));
 
     // Dedup by address (for Redfin props that don't have zpids)
-    const compAddr = (comp.streetAddress || comp.address || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const compAddr = String(comp.streetAddress || comp.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     if (compAddr && compAddr.length > 5) {
       if (seenCompAddresses.has(compAddr)) return;
       seenCompAddresses.add(compAddr);
@@ -1894,10 +1903,18 @@ export default {
         const address = url.searchParams.get('address');
         if (!address) return errorResponse('address parameter required');
         if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
-        const days = parseInt(url.searchParams.get('days')) || 90;
-        const data = await findComps(address, days, env);
-        if (data.error) return errorResponse(data.error, 400);
-        return jsonResponse(data);
+        const days = parseInt(url.searchParams.get('days')) || 180;
+        try {
+          const data = await findComps(address, days, env);
+          if (data.error) return errorResponse(data.error, 400);
+          return jsonResponse(data);
+        } catch (compError) {
+          console.error('findComps error:', compError);
+          return jsonResponse({
+            error: 'Comp search failed: ' + compError.message,
+            errorStack: compError.stack ? compError.stack.substring(0, 500) : null,
+          }, 500);
+        }
       }
 
       // Debug endpoint: raw API response so you can see exactly what ZLLW returns
