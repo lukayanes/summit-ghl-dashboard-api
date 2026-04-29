@@ -462,45 +462,192 @@ async function zillowGetByZpid(zpid, env) {
   return data;
 }
 
+// ==================== REDFIN GEO-SEARCH FOR COMP DISCOVERY ====================
+
 /**
- * Search for properties by location (zip, city, coordinates) using ZLLW search endpoint.
- * Tries multiple endpoint patterns since ZLLW API naming varies.
- * Returns an array of property stubs (zpid, address, price, status, etc.)
+ * Search Redfin for recently sold homes near a coordinate point.
+ * Uses Redfin's public /stingray/api/gis-csv endpoint with a bounding box.
+ * Returns parsed array of property objects with address, price, beds, baths, sqft, etc.
+ *
+ * @param {number} lat - Subject property latitude
+ * @param {number} lng - Subject property longitude
+ * @param {number} radiusMiles - Search radius in miles (default 0.75)
+ * @param {number} soldWithinDays - Only return homes sold within N days (default 180)
  */
-async function zillowSearchByLocation(location, status_type, env) {
-  const cacheKey = 'search_' + location + '_' + (status_type || 'recentlySold');
+async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 180) {
+  // Convert radius to degree offset (rough: 1 degree ≈ 69 miles lat, varies for lng)
+  const latOffset = radiusMiles / 69;
+  const lngOffset = radiusMiles / (69 * Math.cos(lat * Math.PI / 180));
+
+  const south = lat - latOffset;
+  const north = lat + latOffset;
+  const west = lng - lngOffset;
+  const east = lng + lngOffset;
+
+  // Build bounding box polygon string for Redfin: "lng lat,lng lat,lng lat,lng lat"
+  const poly = `${west} ${south},${east} ${south},${east} ${north},${west} ${north},${west} ${south}`;
+
+  const cacheKey = `redfin_${lat.toFixed(4)}_${lng.toFixed(4)}_${radiusMiles}`;
   const cached = getZillowCache(cacheKey);
   if (cached) return cached;
 
-  // Try multiple search endpoint patterns that ZLLW API might support
-  const searchEndpoints = [
-    `/pro/search?location=${encodeURIComponent(location)}&status_type=${status_type || 'RecentlySold'}&home_type=Houses`,
-    `/propertyExtendedSearch?location=${encodeURIComponent(location)}&status_type=${status_type || 'RecentlySold'}&home_type=Houses`,
-    `/search?location=${encodeURIComponent(location)}&status=${status_type || 'recentlySold'}`,
-  ];
+  // Redfin GIS-CSV endpoint parameters:
+  // status=9 = sold, uipt=1,2,3 = house/condo/townhouse, sf=1,2,3,5,6,7 = standard filters
+  // sold_within_days limits recency
+  const params = new URLSearchParams({
+    al: '1',
+    num_homes: '350',
+    ord: 'redfin-recommended-asc',
+    page_number: '1',
+    poly: poly,
+    sf: '1,2,3,5,6,7',
+    sold_within_days: String(soldWithinDays),
+    status: '9',
+    uipt: '1,2,3,4',
+    v: '8',
+  });
 
-  for (const endpoint of searchEndpoints) {
-    try {
-      const data = await zillowRequest(endpoint, env);
-      if (data && (data.props || data.results || data.searchResults || data.properties || data.zpids || Array.isArray(data))) {
-        setZillowCache(cacheKey, data);
-        return data;
+  const url = `https://www.redfin.com/stingray/api/gis-csv?${params.toString()}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/csv,text/plain,*/*',
+        'Referer': 'https://www.redfin.com/',
+      },
+    });
+
+    if (!response.ok) {
+      return { error: `Redfin returned ${response.status}`, properties: [] };
+    }
+
+    const csvText = await response.text();
+    if (!csvText || csvText.length < 50) {
+      return { error: 'Empty response from Redfin', properties: [] };
+    }
+
+    // Parse CSV
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length < 2) {
+      return { error: 'No data rows in Redfin CSV', properties: [] };
+    }
+
+    // Parse headers — Redfin CSV uses quoted headers
+    const headerLine = lines[0];
+    const headers = parseCSVRow(headerLine).map(h => h.toLowerCase().trim());
+
+    // Map header names to indices
+    const col = (name) => {
+      const names = Array.isArray(name) ? name : [name];
+      for (const n of names) {
+        const idx = headers.findIndex(h => h.includes(n.toLowerCase()));
+        if (idx >= 0) return idx;
       }
-      // Check if response has meaningful nested property data
-      if (data && typeof data === 'object') {
-        const extracted = deepExtractProperties(data, 0, 4, null);
-        if (extracted.length >= 3) {
-          setZillowCache(cacheKey, data);
-          return data;
+      return -1;
+    };
+
+    const iAddr = col(['address']);
+    const iCity = col(['city']);
+    const iState = col(['state or province', 'state']);
+    const iZip = col(['zip', 'postal']);
+    const iPrice = col(['price', 'sold price']);
+    const iBeds = col(['beds', 'bedrooms']);
+    const iBaths = col(['baths', 'bathrooms']);
+    const iSqft = col(['square feet', 'sqft', 'sq. ft']);
+    const iLot = col(['lot size', 'lot']);
+    const iYear = col(['year built', 'year']);
+    const iSoldDate = col(['sold date', 'last sale date']);
+    const iType = col(['property type', 'home type']);
+    const iLat = col(['latitude']);
+    const iLng = col(['longitude']);
+    const iUrl = col(['url']);
+    const iListPrice = col(['list price']);
+
+    const properties = [];
+
+    for (let li = 1; li < lines.length; li++) {
+      const vals = parseCSVRow(lines[li]);
+      if (vals.length < 5) continue;
+
+      const addr = iAddr >= 0 ? vals[iAddr] : '';
+      const city = iCity >= 0 ? vals[iCity] : '';
+      const state = iState >= 0 ? vals[iState] : '';
+      const zip = iZip >= 0 ? vals[iZip] : '';
+      const fullAddr = addr + (city ? ', ' + city : '') + (state ? ', ' + state : '') + (zip ? ' ' + zip : '');
+
+      const price = iPrice >= 0 ? parseFloat((vals[iPrice] || '').replace(/[$,]/g, '')) : 0;
+      if (!price || price < 10000) continue; // skip no-price or rental-like
+
+      const soldDate = iSoldDate >= 0 ? vals[iSoldDate] : null;
+      const listPrice = iListPrice >= 0 ? parseFloat((vals[iListPrice] || '').replace(/[$,]/g, '')) : null;
+
+      properties.push({
+        address: fullAddr,
+        streetAddress: addr,
+        city: city,
+        state: state,
+        zipcode: zip,
+        price: price,
+        soldDate: soldDate || null,
+        listPrice: listPrice || null,
+        bedrooms: iBeds >= 0 ? parseInt(vals[iBeds]) || null : null,
+        bathrooms: iBaths >= 0 ? parseFloat(vals[iBaths]) || null : null,
+        livingArea: iSqft >= 0 ? parseInt((vals[iSqft] || '').replace(/,/g, '')) || null : null,
+        lotSize: iLot >= 0 ? parseInt((vals[iLot] || '').replace(/,/g, '')) || null : null,
+        yearBuilt: iYear >= 0 ? parseInt(vals[iYear]) || null : null,
+        propertyType: iType >= 0 ? vals[iType] : null,
+        latitude: iLat >= 0 ? parseFloat(vals[iLat]) || null : null,
+        longitude: iLng >= 0 ? parseFloat(vals[iLng]) || null : null,
+        redfinUrl: iUrl >= 0 ? vals[iUrl] : null,
+        _source: 'redfin',
+        _priceSource: soldDate ? 'redfin:sold' : 'redfin:price',
+      });
+    }
+
+    const result = { properties, totalResults: properties.length, searchRadius: radiusMiles };
+    setZillowCache(cacheKey, result);
+    return result;
+
+  } catch (e) {
+    return { error: 'Redfin fetch failed: ' + e.message, properties: [] };
+  }
+}
+
+/**
+ * Parse a single CSV row, handling quoted fields with commas/newlines inside
+ */
+function parseCSVRow(row) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < row.length && row[i + 1] === '"') {
+          current += '"';
+          i++; // skip escaped quote
+        } else {
+          inQuotes = false;
         }
+      } else {
+        current += ch;
       }
-    } catch (e) {
-      // Endpoint doesn't exist or failed — try next one
-      continue;
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ',') {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
     }
   }
-
-  return null; // No search endpoint worked
+  result.push(current.trim());
+  return result;
 }
 
 // ==================== RENTOMETER API ====================
@@ -1315,73 +1462,28 @@ async function findComps(address, daysBack, env) {
     lastSaleDate: lastSaleDate || null,
   };
 
-  // Step 2: Deep-extract all property-like objects from the subject response
-  const extractedProperties = deepExtractProperties(propertyData, 0, 6, subject.zpid);
+  // Step 2: Deep-extract property-like objects embedded in the Zillow response
+  // These are typically immediate neighbors with Zestimates (used as fallback)
+  const allExtracted = deepExtractProperties(propertyData, 0, 6, subject.zpid);
 
-  // Step 2b: Try location-based search for recently sold homes in the same zip
-  let searchExtracted = [];
-  const zipOrCity = subject.zipcode || (subject.city && subject.state ? `${subject.city}, ${subject.state}` : null);
-  if (zipOrCity) {
-    try {
-      const searchData = await zillowSearchByLocation(zipOrCity, 'RecentlySold', env);
-      if (searchData) {
-        searchExtracted = deepExtractProperties(searchData, 0, 4, subject.zpid);
-      }
-    } catch (e) { /* search endpoint not available — that's fine */ }
-  }
-
-  // Merge all extracted properties, dedup by zpid
-  const allExtracted = [];
-  const seenExtractedZpids = new Set();
-  [...extractedProperties, ...searchExtracted].forEach(ep => {
-    const id = ep.zpid || (ep.address || ep.streetAddress || '') + '_' + (ep.price || ep.soldPrice || '');
-    if (id && !seenExtractedZpids.has(id)) {
-      seenExtractedZpids.add(id);
-      allExtracted.push(ep);
-    }
-  });
-
-  // Step 3: Fetch ALL zpids individually for full property data
-  // KEY INSIGHT: In non-disclosure states (TX), embedded property stubs only have
-  // Zestimates. The individual /pro/byzpid lookup returns priceHistory with actual
-  // pending/sold prices. So we fetch ALL zpids, not just ones without prices.
-  const zpidsToFetch = [];
+  // =====================================================================
+  // Step 3: REDFIN GEO-SEARCH — find recently sold homes by radius
+  // Redfin's public CSV endpoint returns actual sold prices and dates
+  // for any area, including non-disclosure states like TX.
+  // This is the PRIMARY comp discovery method.
+  // =====================================================================
   const fullDataProps = [];
-  const seenFetchZpids = new Set();
-  const stubsByZpid = new Map(); // Keep stubs as fallback if fetch fails
+  const allSeenZpids = new Set([String(subject.zpid)]);
+  const fetchedZpids = new Set();
+  let redfinResults = { properties: [] };
+  let redfinError = null;
+  let zillowEnrichedCount = 0;
 
-  allExtracted.forEach(ep => {
-    const hasSoldPrice = ep.soldPrice || ep.lastSoldPrice || ep.lastSalePrice;
-    const hasBasicData = (ep.livingArea || ep.sqft || ep.bedrooms || ep.beds);
-    const hasPriceHistory = Array.isArray(ep.priceHistory) && ep.priceHistory.length > 0;
-
-    if (hasSoldPrice && hasBasicData && hasPriceHistory) {
-      // Has everything — use as-is (no need to refetch)
-      fullDataProps.push(ep);
-    } else if (ep.zpid && !seenFetchZpids.has(ep.zpid)) {
-      // Queue for individual fetch to get priceHistory + full details
-      zpidsToFetch.push(ep.zpid);
-      seenFetchZpids.add(ep.zpid);
-      // Save the stub so we can fall back to it if the fetch fails
-      stubsByZpid.set(String(ep.zpid), ep);
-    } else if (!ep.zpid && hasSoldPrice && hasBasicData) {
-      fullDataProps.push(ep);
-    }
-  });
-
-  // Fetch zpids individually with retry logic
-  // Batch in groups of 3 (smaller batches = less rate limiting)
-  // Retry failed fetches once with a delay
-  const maxFetch = 25;
-  const fetchedZpids = new Set(); // track which zpids we successfully fetched
-
-  if (zpidsToFetch.length > 0) {
-    const toFetch = zpidsToFetch.slice(0, maxFetch);
-    const batchSize = 3;
-    const failedZpids = [];
-
-    for (let i = 0; i < toFetch.length; i += batchSize) {
-      const batch = toFetch.slice(i, i + batchSize);
+  // Helper: batch-fetch zpids with rate limiting
+  async function batchFetchZpids(zpidList, batchSize = 3, delayMs = 250) {
+    const results = [];
+    for (let i = 0; i < zpidList.length; i += batchSize) {
+      const batch = zpidList.slice(i, i + batchSize);
       const fetched = await Promise.allSettled(
         batch.map(zpid => zillowGetByZpid(zpid, env))
       );
@@ -1390,79 +1492,114 @@ async function findComps(address, daysBack, env) {
         if (result.status === 'fulfilled' && result.value) {
           const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
           if (fd.zpid || fd.address || fd.streetAddress) {
-            fullDataProps.push(fd);
-            fetchedZpids.add(String(zpid));
-          } else {
-            failedZpids.push(zpid);
+            results.push({ zpid, data: fd, raw: result.value });
           }
-        } else {
-          failedZpids.push(zpid);
         }
       });
-      // Small delay between batches to avoid rate limiting
-      if (i + batchSize < toFetch.length) {
-        await new Promise(r => setTimeout(r, 300));
+      if (i + batchSize < zpidList.length) {
+        await new Promise(r => setTimeout(r, delayMs));
       }
     }
+    return results;
+  }
 
-    // Retry failed fetches once with a delay
-    if (failedZpids.length > 0) {
-      await new Promise(r => setTimeout(r, 1000));
-      for (let i = 0; i < failedZpids.length; i += batchSize) {
-        const batch = failedZpids.slice(i, i + batchSize);
-        const retried = await Promise.allSettled(
-          batch.map(zpid => zillowGetByZpid(zpid, env))
-        );
-        retried.forEach((result, idx) => {
-          const zpid = batch[idx];
-          if (result.status === 'fulfilled' && result.value) {
-            const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
-            if (fd.zpid || fd.address || fd.streetAddress) {
-              fullDataProps.push(fd);
-              fetchedZpids.add(String(zpid));
-            }
-          }
-        });
-        if (i + batchSize < failedZpids.length) {
-          await new Promise(r => setTimeout(r, 300));
-        }
-      }
-    }
-
-    // For any zpids that STILL failed to fetch, use the original stub data as fallback
-    // This ensures we at least show properties with Zestimate prices (labeled accordingly)
-    // rather than losing them entirely
-    for (const [zpidStr, stub] of stubsByZpid.entries()) {
-      if (!fetchedZpids.has(zpidStr)) {
-        fullDataProps.push(stub);
-      }
+  // === PRIMARY: Redfin radius search ===
+  if (subject.latitude && subject.longitude) {
+    try {
+      // Search 0.75 mile radius — typically covers the subdivision without crossing arterials
+      redfinResults = await redfinSearchSold(subject.latitude, subject.longitude, 0.75, daysBack || 180);
+      if (redfinResults.error) redfinError = redfinResults.error;
+    } catch (e) {
+      redfinError = e.message;
     }
   }
+
+  const redfinProps = redfinResults.properties || [];
+
+  // Add Redfin results directly — they already have verified sold prices & dates
+  const seenAddresses = new Set();
+  redfinProps.forEach(rp => {
+    // Normalize address for dedup
+    const normAddr = (rp.streetAddress || rp.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const subjectNorm = (subject.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (normAddr === subjectNorm) return; // skip subject
+    if (seenAddresses.has(normAddr)) return;
+    seenAddresses.add(normAddr);
+    fullDataProps.push(rp);
+  });
+
+  // === FALLBACK: Also use ZLLW embedded properties ===
+  // Fetch zpids from ZLLW response individually to get priceHistory
+  // (may find comps that Redfin missed, or enrich with Zillow photos/zpids)
+  const zpidsToFetch = [];
+  allExtracted.forEach(ep => {
+    const zpidStr = String(ep.zpid || '');
+    if (ep.zpid && !allSeenZpids.has(zpidStr)) {
+      allSeenZpids.add(zpidStr);
+      zpidsToFetch.push(ep.zpid);
+    }
+  });
+
+  // Fetch up to 10 ZLLW zpids for additional data (less aggressive since Redfin is primary)
+  if (zpidsToFetch.length > 0) {
+    const hop1Results = await batchFetchZpids(zpidsToFetch.slice(0, 10));
+    hop1Results.forEach(({ zpid, data }) => {
+      fetchedZpids.add(String(zpid));
+      fullDataProps.push(data);
+    });
+    zillowEnrichedCount = hop1Results.length;
+  }
+
+  // Also add extracted stubs that weren't fetched (Zestimate fallback)
+  allExtracted.forEach(ep => {
+    if (ep.zpid && !fetchedZpids.has(String(ep.zpid))) {
+      fullDataProps.push(ep);
+    }
+  });
 
   // Step 4: Process all properties into scored comps
   const cutoffDate = new Date(Date.now() - (daysBack || 180) * 24 * 60 * 60 * 1000);
   const scoredComps = [];
   const seenZpids = new Set();
+  const seenCompAddresses = new Set();
 
   fullDataProps.forEach(comp => {
     if (!comp || typeof comp !== 'object') return;
     if (comp.zpid && comp.zpid === subject.zpid) return;
-    if (comp.zpid && seenZpids.has(comp.zpid)) return;
-    if (comp.zpid) seenZpids.add(comp.zpid);
+
+    // Dedup by zpid
+    if (comp.zpid && seenZpids.has(String(comp.zpid))) return;
+    if (comp.zpid) seenZpids.add(String(comp.zpid));
+
+    // Dedup by address (for Redfin props that don't have zpids)
+    const compAddr = (comp.streetAddress || comp.address || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (compAddr && compAddr.length > 5) {
+      if (seenCompAddresses.has(compAddr)) return;
+      seenCompAddresses.add(compAddr);
+    }
 
     // Filter out rental listings
     const compStatus = (comp.homeStatus || comp.statusType || comp.listingStatus || comp.status || '').toString().toLowerCase();
     if (compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent') return;
 
-    // === PRICE EXTRACTION (improved for non-disclosure states) ===
+    // === PRICE EXTRACTION ===
     let price = 0;
     let priceSource = null;
-    let soldDateStr = comp.dateSold || comp.lastSoldDate || comp.dateSoldString || null;
+    let soldDateStr = comp.dateSold || comp.lastSoldDate || comp.dateSoldString || comp.soldDate || null;
 
-    // Priority 1: Explicit sold price fields
-    price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
-    if (price > 0) {
-      priceSource = comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : 'lastSalePrice';
+    // REDFIN FAST-PATH: Redfin comps already have verified sold prices & dates
+    if (comp._source === 'redfin' && comp.price > 0) {
+      price = comp.price;
+      priceSource = comp._priceSource || 'redfin:sold';
+      if (!soldDateStr && comp.soldDate) soldDateStr = comp.soldDate;
+    }
+
+    // Priority 1: Explicit sold price fields (Zillow)
+    if (price <= 0) {
+      price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
+      if (price > 0) {
+        priceSource = comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : 'lastSalePrice';
+      }
     }
 
     // Priority 2: priceHistory — the gold standard for non-disclosure states
@@ -1594,9 +1731,9 @@ async function findComps(address, daysBack, env) {
     comps: scoredComps,
     compCount: scoredComps.length,
     totalExtracted: allExtracted.length,
-    zpidsFetched: Math.min(zpidsToFetch.length, maxFetch),
+    zpidsFetched: fetchedZpids.size,
     fullDataCount: fullDataProps.length,
-    searchExtractedCount: searchExtracted.length,
+    redfinCompsFound: redfinProps.length,
     daysBack: daysBack || 180,
     suggestedARV: avgARV,
     medianARV: medianARV,
@@ -1606,18 +1743,19 @@ async function findComps(address, daysBack, env) {
     generatedAt: new Date().toISOString(),
     _debug: {
       topLevelKeys: Object.keys(propertyData || {}),
-      extractedFromSubject: extractedProperties.length,
-      extractedFromSearch: searchExtracted.length,
+      zillowEmbeddedProps: allExtracted.length,
+      redfinSoldFound: redfinProps.length,
       totalExtracted: allExtracted.length,
       extractedWithZpid: allExtracted.filter(e => e.zpid).length,
       extractedWithSoldPrice: allExtracted.filter(e => e.soldPrice || e.lastSoldPrice || e.lastSalePrice).length,
       extractedWithPriceHistory: allExtracted.filter(e => Array.isArray(e.priceHistory) && e.priceHistory.length > 0).length,
       extractedWithGenericPrice: allExtracted.filter(e => e.price && !e.soldPrice && !e.lastSoldPrice && !e.lastSalePrice).length,
-      zpidsQueuedForFetch: zpidsToFetch.length,
-      zpidsFetchedSuccessfully: fetchedZpids.size,
-      zpidsFetchFailed: zpidsToFetch.slice(0, maxFetch).length - fetchedZpids.size,
-      stubsUsedAsFallback: zpidsToFetch.slice(0, maxFetch).length - fetchedZpids.size,
-      fullDataAfterFetch: fullDataProps.length,
+      redfinResults: redfinProps.length,
+      redfinError: redfinError,
+      redfinRadius: redfinResults.searchRadius || 0.75,
+      zillowEmbedded: allExtracted.length,
+      zillowEnriched: zillowEnrichedCount,
+      totalCandidates: fullDataProps.length,
       fullDataWithPriceHistory: fullDataProps.filter(f => Array.isArray(f.priceHistory) && f.priceHistory.length > 0).length,
       verifiedPriceComps: verifiedComps.length,
       filteredOut: fullDataProps.length - scoredComps.length,
