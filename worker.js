@@ -1511,13 +1511,13 @@ export default {
       });
     }
 
-    // Only allow GET requests
-    if (request.method !== 'GET') {
-      return errorResponse('Method not allowed', 405);
-    }
-
     const url = new URL(request.url);
     const pathname = url.pathname;
+
+    // Allow GET and POST (POST needed for photo uploads)
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      return errorResponse('Method not allowed', 405);
+    }
 
     try {
       // Validate environment variables
@@ -1697,6 +1697,67 @@ export default {
         const bedrooms = url.searchParams.get('bedrooms') || '3';
         const data = await rentometerSummary(address, bedrooms, env);
         return jsonResponse(data);
+      }
+
+      // ---- Seller Photo Storage (Cloudflare KV) ----
+
+      if (pathname === '/api/photos/upload' && request.method === 'POST') {
+        // Upload a seller photo — stores base64 image in KV
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        try {
+          const body = await request.json();
+          const { dealId, photoData } = body;
+          if (!dealId || !photoData) return errorResponse('dealId and photoData required');
+          // photoData is a base64 data URL
+          // Limit: 25MB per KV value, base64 images are typically 100KB-2MB
+          if (photoData.length > 5 * 1024 * 1024) return errorResponse('Photo too large (max 5MB)');
+          await env.SELLER_PHOTOS.put('photo:' + dealId, photoData);
+          return jsonResponse({ success: true, dealId: dealId });
+        } catch(e) {
+          return errorResponse('Photo upload failed: ' + e.message);
+        }
+      }
+
+      if (pathname === '/api/photos/get') {
+        // Get a single photo by dealId
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        const dealId = url.searchParams.get('dealId');
+        if (!dealId) return errorResponse('dealId parameter required');
+        const photo = await env.SELLER_PHOTOS.get('photo:' + dealId);
+        return jsonResponse({ dealId: dealId, photoData: photo || null });
+      }
+
+      if (pathname === '/api/photos/list') {
+        // List all stored photos (returns dealIds only, not photo data)
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        const list = await env.SELLER_PHOTOS.list({ prefix: 'photo:' });
+        const dealIds = list.keys.map(k => k.name.replace('photo:', ''));
+        return jsonResponse({ dealIds: dealIds, count: dealIds.length });
+      }
+
+      if (pathname === '/api/photos/batch') {
+        // Get multiple photos at once
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        const ids = (url.searchParams.get('dealIds') || '').split(',').filter(Boolean);
+        if (ids.length === 0) return errorResponse('dealIds parameter required (comma-separated)');
+        const photos = {};
+        await Promise.all(ids.map(async (id) => {
+          const photo = await env.SELLER_PHOTOS.get('photo:' + id);
+          if (photo) photos[id] = photo;
+        }));
+        return jsonResponse({ photos: photos, count: Object.keys(photos).length });
+      }
+
+      if (pathname === '/api/photos/delete' && request.method === 'POST') {
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        try {
+          const body = await request.json();
+          if (!body.dealId) return errorResponse('dealId required');
+          await env.SELLER_PHOTOS.delete('photo:' + body.dealId);
+          return jsonResponse({ success: true, deleted: body.dealId });
+        } catch(e) {
+          return errorResponse('Delete failed: ' + e.message);
+        }
       }
 
       if (pathname === '/health') {
