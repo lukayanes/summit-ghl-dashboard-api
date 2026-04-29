@@ -462,6 +462,47 @@ async function zillowGetByZpid(zpid, env) {
   return data;
 }
 
+/**
+ * Search for properties by location (zip, city, coordinates) using ZLLW search endpoint.
+ * Tries multiple endpoint patterns since ZLLW API naming varies.
+ * Returns an array of property stubs (zpid, address, price, status, etc.)
+ */
+async function zillowSearchByLocation(location, status_type, env) {
+  const cacheKey = 'search_' + location + '_' + (status_type || 'recentlySold');
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  // Try multiple search endpoint patterns that ZLLW API might support
+  const searchEndpoints = [
+    `/pro/search?location=${encodeURIComponent(location)}&status_type=${status_type || 'RecentlySold'}&home_type=Houses`,
+    `/propertyExtendedSearch?location=${encodeURIComponent(location)}&status_type=${status_type || 'RecentlySold'}&home_type=Houses`,
+    `/search?location=${encodeURIComponent(location)}&status=${status_type || 'recentlySold'}`,
+  ];
+
+  for (const endpoint of searchEndpoints) {
+    try {
+      const data = await zillowRequest(endpoint, env);
+      if (data && (data.props || data.results || data.searchResults || data.properties || data.zpids || Array.isArray(data))) {
+        setZillowCache(cacheKey, data);
+        return data;
+      }
+      // Check if response has meaningful nested property data
+      if (data && typeof data === 'object') {
+        const extracted = deepExtractProperties(data, 0, 4, null);
+        if (extracted.length >= 3) {
+          setZillowCache(cacheKey, data);
+          return data;
+        }
+      }
+    } catch (e) {
+      // Endpoint doesn't exist or failed — try next one
+      continue;
+    }
+  }
+
+  return null; // No search endpoint worked
+}
+
 // ==================== RENTOMETER API ====================
 
 const RENTOMETER_BASE = 'https://www.rentometer.com/api/v1';
@@ -1144,10 +1185,66 @@ function scoreComp(subject, comp) {
 }
 
 /**
- * Find comps for a subject property
- * 1. Get subject details from Zillow
- * 2. Search recently sold in the same zip
- * 3. Score & rank each sold property
+ * Extract the best sale price and date from a property's priceHistory.
+ * In non-disclosure states (TX, NM, UT, etc.), "Sold" events have no price —
+ * use the Pending/Listed price that preceded the sold event instead.
+ * Returns { price, date, source } or null.
+ */
+function extractSalePriceFromHistory(priceHistory) {
+  if (!Array.isArray(priceHistory) || priceHistory.length === 0) return null;
+  const sorted = [...priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  // Pass 1: find the most recent Sold event with a price
+  for (const evt of sorted) {
+    const t = (evt.event || '').toLowerCase();
+    if ((t === 'sold' || t.includes('sold')) && evt.price && evt.price > 10000) {
+      return { price: evt.price, date: evt.date || null, source: 'history:sold' };
+    }
+  }
+
+  // Pass 2: Sold event exists but has no price (non-disclosure state)
+  // Find the Pending/Listed price that preceded the most recent sold
+  for (let i = 0; i < sorted.length; i++) {
+    const t = (sorted[i].event || '').toLowerCase();
+    if (t === 'sold' || t.includes('sold')) {
+      // Walk to older entries to find preceding pending/listed price
+      for (let j = i + 1; j < sorted.length; j++) {
+        const jt = (sorted[j].event || '').toLowerCase();
+        if ((jt.includes('pending') || jt.includes('contingent')) && sorted[j].price && sorted[j].price > 10000) {
+          return { price: sorted[j].price, date: sorted[i].date || sorted[j].date || null, source: 'history:pending_before_sold' };
+        }
+        if ((jt.includes('listed') || jt.includes('price change')) && sorted[j].price && sorted[j].price > 10000) {
+          return { price: sorted[j].price, date: sorted[i].date || sorted[j].date || null, source: 'history:listed_before_sold' };
+        }
+      }
+      // Sold event found but no preceding price — use its date at least
+      break;
+    }
+  }
+
+  // Pass 3: No Sold event — look for Pending or Contingent (in-contract, about to close)
+  for (const evt of sorted) {
+    const t = (evt.event || '').toLowerCase();
+    if ((t.includes('pending') || t.includes('contingent')) && evt.price && evt.price > 10000) {
+      return { price: evt.price, date: evt.date || null, source: 'history:pending' };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Find comps for a subject property — improved for non-disclosure states (TX, etc.)
+ *
+ * Strategy:
+ * 1. Get subject property details
+ * 2. Deep-extract embedded properties from the response
+ * 3. Try a location-based search for recently sold homes in the same zip
+ * 4. Fetch EVERY extracted zpid individually (critical for TX — the individual
+ *    property lookup returns priceHistory with actual pending/sold prices,
+ *    while the embedded stubs only have Zestimates)
+ * 5. Use extractSalePriceFromHistory to find real prices
+ * 6. Score, rank, and return
  */
 async function findComps(address, daysBack, env) {
   // Step 1: Get subject property details
@@ -1163,7 +1260,7 @@ async function findComps(address, daysBack, env) {
     return { error: 'No Zillow data found for this address', rawResponse: propertyData };
   }
 
-  // Extract subject photos from various Zillow response shapes
+  // Extract subject photos
   const subjectPhotos = [];
   const photoSources = p.photos || p.responsivePhotos || p.hugePhotos || p.hiResPhotos || [];
   if (Array.isArray(photoSources)) {
@@ -1171,7 +1268,6 @@ async function findComps(address, daysBack, env) {
       if (typeof photo === 'string') { subjectPhotos.push(photo); }
       else if (photo?.url) { subjectPhotos.push(photo.url); }
       else if (photo?.mixedSources?.jpeg) {
-        // Zillow responsive format — pick the largest
         const jpegs = photo.mixedSources.jpeg;
         const largest = jpegs.reduce((best, cur) => ((cur.width || 0) > (best.width || 0) ? cur : best), jpegs[0]);
         if (largest?.url) subjectPhotos.push(largest.url);
@@ -1179,51 +1275,22 @@ async function findComps(address, daysBack, env) {
     });
   }
 
-  // Extract last sale price and date from various Zillow fields
+  // Extract subject's last sale price using the improved helper
   let lastSalePrice = p.lastSoldPrice || p.lastSalePrice || p.soldPrice || p.salePrice || null;
   let lastSaleDate = p.dateSold || p.lastSoldDate || p.dateSoldString || null;
 
-  // Check priceHistory for the most recent sale event
-  if (Array.isArray(p.priceHistory) && p.priceHistory.length > 0) {
-    // Sort all events by date descending
-    const sortedHistory = [...p.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-
-    const saleEvents = sortedHistory.filter(e => e.event && (e.event.toLowerCase() === 'sold' || e.event.toLowerCase().includes('sold')));
-    if (saleEvents.length > 0) {
-      const mostRecentSale = saleEvents[0];
-      if (!lastSaleDate && mostRecentSale.date) lastSaleDate = mostRecentSale.date;
-      if (!lastSalePrice && mostRecentSale.price) lastSalePrice = mostRecentSale.price;
-
-      // Non-disclosure state fallback: if "Sold" has no price (shows "--"),
-      // look for the "Pending sale" event immediately before it — that price
-      // is almost always the actual sale price in non-disclosure states (TX, etc.)
-      if (!lastSalePrice) {
-        const saleIdx = sortedHistory.indexOf(mostRecentSale);
-        // Walk forward (older entries) from the sold event looking for Pending sale or last listed price
-        for (let hi = saleIdx + 1; hi < sortedHistory.length; hi++) {
-          const evt = sortedHistory[hi];
-          const evtType = (evt.event || '').toLowerCase();
-          if ((evtType.includes('pending') || evtType.includes('contingent')) && evt.price) {
-            lastSalePrice = evt.price;
-            break;
-          }
-          // Also accept the most recent "Price change" or "Listed for sale" before the sold event
-          if ((evtType.includes('price change') || evtType.includes('listed')) && evt.price) {
-            lastSalePrice = evt.price;
-            break;
-          }
-        }
-      }
+  if ((!lastSalePrice || !lastSaleDate) && Array.isArray(p.priceHistory)) {
+    const histResult = extractSalePriceFromHistory(p.priceHistory);
+    if (histResult) {
+      if (!lastSalePrice) lastSalePrice = histResult.price;
+      if (!lastSaleDate) lastSaleDate = histResult.date;
     }
   }
 
-  // Tax history fallback — some properties have assessed values
+  // Tax history fallback
   if (!lastSalePrice && Array.isArray(p.taxHistory) && p.taxHistory.length > 0) {
     const sorted = [...p.taxHistory].sort((a, b) => (b.time || 0) - (a.time || 0));
-    if (sorted[0] && sorted[0].value) {
-      // Tax assessed value is a rough proxy, not exact sale price — flag it
-      lastSalePrice = sorted[0].value;
-    }
+    if (sorted[0] && sorted[0].value) lastSalePrice = sorted[0].value;
   }
 
   const subject = {
@@ -1248,148 +1315,171 @@ async function findComps(address, daysBack, env) {
     lastSaleDate: lastSaleDate || null,
   };
 
-  // Step 2: Deep-extract all property-like objects from the response
-  // The ZLLW API embeds comps, nearby sales, similar homes in the property data
+  // Step 2: Deep-extract all property-like objects from the subject response
   const extractedProperties = deepExtractProperties(propertyData, 0, 6, subject.zpid);
 
-  // Step 2b: Categorize extracted properties
-  // In non-disclosure states (TX, etc.), sold prices are hidden — we need to fetch
-  // full property details (with priceHistory) to find the pending sale price.
+  // Step 2b: Try location-based search for recently sold homes in the same zip
+  let searchExtracted = [];
+  const zipOrCity = subject.zipcode || (subject.city && subject.state ? `${subject.city}, ${subject.state}` : null);
+  if (zipOrCity) {
+    try {
+      const searchData = await zillowSearchByLocation(zipOrCity, 'RecentlySold', env);
+      if (searchData) {
+        searchExtracted = deepExtractProperties(searchData, 0, 4, subject.zpid);
+      }
+    } catch (e) { /* search endpoint not available — that's fine */ }
+  }
+
+  // Merge all extracted properties, dedup by zpid
+  const allExtracted = [];
+  const seenExtractedZpids = new Set();
+  [...extractedProperties, ...searchExtracted].forEach(ep => {
+    const id = ep.zpid || (ep.address || ep.streetAddress || '') + '_' + (ep.price || ep.soldPrice || '');
+    if (id && !seenExtractedZpids.has(id)) {
+      seenExtractedZpids.add(id);
+      allExtracted.push(ep);
+    }
+  });
+
+  // Step 3: Collect ALL zpids to fetch individually
+  // KEY INSIGHT: In non-disclosure states (TX), embedded property stubs only have
+  // Zestimates. The individual /pro/byzpid lookup returns priceHistory with actual
+  // pending/sold prices. So we fetch ALL zpids, not just ones without prices.
   const zpidsToFetch = [];
   const fullDataProps = [];
   const seenFetchZpids = new Set();
 
-  extractedProperties.forEach(ep => {
+  allExtracted.forEach(ep => {
     const hasSoldPrice = ep.soldPrice || ep.lastSoldPrice || ep.lastSalePrice;
     const hasBasicData = (ep.livingArea || ep.sqft || ep.bedrooms || ep.beds);
     const hasPriceHistory = Array.isArray(ep.priceHistory) && ep.priceHistory.length > 0;
 
-    if (hasSoldPrice && hasBasicData) {
-      // Has a direct sold price — can use as-is
-      fullDataProps.push(ep);
-    } else if (hasPriceHistory && hasBasicData) {
-      // Has priceHistory (can extract pending sale price) — use as-is
+    if (hasSoldPrice && hasBasicData && hasPriceHistory) {
+      // Has everything — use as-is (no need to refetch)
       fullDataProps.push(ep);
     } else if (ep.zpid && !seenFetchZpids.has(ep.zpid)) {
-      // Need to fetch full details to get priceHistory (non-disclosure state)
-      // or to get missing data fields
+      // Fetch individually to get priceHistory + full details
       zpidsToFetch.push(ep.zpid);
       seenFetchZpids.add(ep.zpid);
+    } else if (!ep.zpid && hasSoldPrice && hasBasicData) {
+      // No zpid but has good data — keep it
+      fullDataProps.push(ep);
     }
   });
 
-  // Fetch up to 15 individual zpids for more detail (parallel, with error tolerance)
-  // Higher limit to account for non-disclosure states needing priceHistory lookups
+  // Fetch up to 25 zpids individually (raised from 15 for better coverage)
+  // Batch in groups of 5 to avoid overwhelming the API
+  const maxFetch = 25;
   if (zpidsToFetch.length > 0) {
-    const toFetch = zpidsToFetch.slice(0, 15);
-    const fetched = await Promise.allSettled(
-      toFetch.map(zpid => zillowGetByZpid(zpid, env))
-    );
-    fetched.forEach(result => {
-      if (result.status === 'fulfilled' && result.value) {
-        const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
-        if (fd.zpid || fd.address || fd.streetAddress) {
-          fullDataProps.push(fd);
+    const toFetch = zpidsToFetch.slice(0, maxFetch);
+    const batchSize = 5;
+    for (let i = 0; i < toFetch.length; i += batchSize) {
+      const batch = toFetch.slice(i, i + batchSize);
+      const fetched = await Promise.allSettled(
+        batch.map(zpid => zillowGetByZpid(zpid, env))
+      );
+      fetched.forEach(result => {
+        if (result.status === 'fulfilled' && result.value) {
+          const fd = result.value?.propertyDetails || result.value?.data || result.value || {};
+          if (fd.zpid || fd.address || fd.streetAddress) {
+            fullDataProps.push(fd);
+          }
         }
-      }
-    });
+      });
+    }
   }
 
-  // Step 3: Filter by days and score each
-  const cutoffDate = new Date(Date.now() - (daysBack || 90) * 24 * 60 * 60 * 1000);
+  // Step 4: Process all properties into scored comps
+  const cutoffDate = new Date(Date.now() - (daysBack || 180) * 24 * 60 * 60 * 1000);
   const scoredComps = [];
   const seenZpids = new Set();
 
   fullDataProps.forEach(comp => {
     if (!comp || typeof comp !== 'object') return;
-    // Skip the subject property itself
     if (comp.zpid && comp.zpid === subject.zpid) return;
-    // Skip dupes
     if (comp.zpid && seenZpids.has(comp.zpid)) return;
     if (comp.zpid) seenZpids.add(comp.zpid);
-
-    // Date filter — check direct fields first, then priceHistory for sold/pending dates
-    let soldDateStr = comp.dateSold || comp.lastSoldDate || comp.dateSoldString || null;
-
-    // If no direct sold date, pull it from priceHistory (sold or pending event)
-    if (!soldDateStr && Array.isArray(comp.priceHistory) && comp.priceHistory.length > 0) {
-      const sorted = [...comp.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-      for (let hi = 0; hi < sorted.length; hi++) {
-        const evtType = (sorted[hi].event || '').toLowerCase();
-        if ((evtType === 'sold' || evtType.includes('sold') || evtType.includes('pending') || evtType.includes('contingent')) && sorted[hi].date) {
-          soldDateStr = sorted[hi].date;
-          break;
-        }
-      }
-    }
-
-    if (soldDateStr) {
-      const soldDate = new Date(soldDateStr);
-      if (!isNaN(soldDate.getTime()) && soldDate < cutoffDate) return;
-    }
 
     // Filter out rental listings
     const compStatus = (comp.homeStatus || comp.statusType || comp.listingStatus || comp.status || '').toString().toLowerCase();
     if (compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent') return;
 
-    // Priority 1: Explicit sold price fields
-    let price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
-    let priceSource = comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : comp.lastSalePrice ? 'lastSalePrice' : null;
+    // === PRICE EXTRACTION (improved for non-disclosure states) ===
+    let price = 0;
+    let priceSource = null;
+    let soldDateStr = comp.dateSold || comp.lastSoldDate || comp.dateSoldString || null;
 
-    // Priority 2: priceHistory — sold event price, then pending sale price
-    if (price <= 0 && Array.isArray(comp.priceHistory) && comp.priceHistory.length > 0) {
-      const sorted = [...comp.priceHistory].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
-      for (let hi = 0; hi < sorted.length; hi++) {
-        const evtType = (sorted[hi].event || '').toLowerCase();
-        if ((evtType === 'sold' || evtType.includes('sold')) && sorted[hi].price) {
-          price = sorted[hi].price;
-          priceSource = 'priceHistory:sold';
-          break;
+    // Priority 1: Explicit sold price fields
+    price = comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || 0;
+    if (price > 0) {
+      priceSource = comp.soldPrice ? 'soldPrice' : comp.lastSoldPrice ? 'lastSoldPrice' : 'lastSalePrice';
+    }
+
+    // Priority 2: priceHistory — the gold standard for non-disclosure states
+    if (Array.isArray(comp.priceHistory) && comp.priceHistory.length > 0) {
+      const histResult = extractSalePriceFromHistory(comp.priceHistory);
+      if (histResult) {
+        // If we got a price from priceHistory and either:
+        // - we had no price before, OR
+        // - the existing price looks like a Zestimate (matches comp.zestimate or comp.price but not a sold field)
+        const existingIsZestimate = price > 0 && !comp.soldPrice && !comp.lastSoldPrice && !comp.lastSalePrice
+          && (price === comp.zestimate || price === comp.price);
+        if (price <= 0 || existingIsZestimate) {
+          price = histResult.price;
+          priceSource = histResult.source;
         }
-      }
-      if (price <= 0) {
-        for (let hi = 0; hi < sorted.length; hi++) {
-          const evtType = (sorted[hi].event || '').toLowerCase();
-          if ((evtType.includes('pending') || evtType.includes('contingent')) && sorted[hi].price) {
-            price = sorted[hi].price;
-            priceSource = 'priceHistory:pending';
-            break;
-          }
-        }
+        if (!soldDateStr && histResult.date) soldDateStr = histResult.date;
       }
     }
 
-    // Priority 3: If status indicates recently sold / other (NOT active listing or rental),
-    // accept generic price as probable sale price. In non-disclosure states the API often
-    // only provides price (no soldPrice, no priceHistory) for recently sold nearby properties.
+    // Priority 3: If no priceHistory result, check generic price + status
     if (price <= 0 && (comp.price || comp.salePrice)) {
-      const statusLower = compStatus;
-      const isActiveListing = statusLower.includes('for_sale') || statusLower.includes('coming_soon')
-        || statusLower.includes('new_listing') || statusLower.includes('active');
-      const isRental = statusLower.includes('for_rent') || statusLower.includes('rental') || statusLower === 'rent';
+      const isActiveListing = compStatus.includes('for_sale') || compStatus.includes('coming_soon')
+        || compStatus.includes('new_listing') || compStatus.includes('active');
+      const isRental = compStatus.includes('for_rent') || compStatus.includes('rental') || compStatus === 'rent';
 
       if (!isActiveListing && !isRental) {
-        // Status is OTHER, RECENTLY_SOLD, SOLD, PENDING, or empty — accept as probable sold price
         price = comp.salePrice || comp.price;
         priceSource = 'price:' + (compStatus || 'inferred');
       }
     }
 
+    // Skip if no real price found
     if (price <= 0) return;
-
-    // Skip if price looks like a monthly rent (under $10k and no sold date)
+    // Skip if price looks like a monthly rent
     if (price < 10000 && !soldDateStr) return;
 
-    // Calculate distance if we have coords
+    // ZESTIMATE DETECTION: If the price exactly matches the Zestimate and we have
+    // no sold date and no priceHistory sale event, this is just a Zestimate — skip it
+    const isLikelyZestimate = comp.zestimate && price === comp.zestimate && !soldDateStr
+      && (!priceSource || priceSource.startsWith('price:'));
+    if (isLikelyZestimate) return;
+
+    // Date filter — allow wider window for non-disclosure states
+    if (soldDateStr) {
+      const soldDate = new Date(soldDateStr);
+      if (!isNaN(soldDate.getTime()) && soldDate < cutoffDate) return;
+    }
+
+    // Calculate distance
     let distance = null;
-    if (subject.latitude && subject.longitude && (comp.latitude && comp.longitude)) {
+    if (subject.latitude && subject.longitude && comp.latitude && comp.longitude) {
       distance = haversineDistance(subject.latitude, subject.longitude, comp.latitude, comp.longitude);
-      // Skip if > 5 miles
       if (distance > 5) return;
     }
 
     comp._distance = distance;
     const scoring = scoreComp(subject, comp);
+
+    // Bonus: deprioritize comps that only have generic price (likely Zestimate)
+    let adjustedMatchPct = scoring.matchPct;
+    if (priceSource && priceSource.startsWith('price:')) {
+      adjustedMatchPct = Math.max(0, adjustedMatchPct - 10); // small penalty for uncertain price source
+    }
+    // Bonus: boost comps with verified sale prices
+    if (priceSource && (priceSource.includes('sold') || priceSource.includes('pending_before_sold'))) {
+      adjustedMatchPct = Math.min(100, adjustedMatchPct + 5);
+    }
 
     scoredComps.push({
       address: comp.address || comp.streetAddress || comp.formattedAddress || '',
@@ -1407,59 +1497,72 @@ async function findComps(address, daysBack, env) {
       distance: distance ? Math.round(distance * 100) / 100 : null,
       zpid: comp.zpid || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
-      // Price source tracking — which field the price came from
-      _priceSource: priceSource || 'priceHistory',
-      // Scoring
-      matchPct: scoring.matchPct,
-      grade: scoring.grade,
+      _priceSource: priceSource || 'unknown',
+      matchPct: adjustedMatchPct,
+      grade: adjustedMatchPct >= 85 ? 'A' : adjustedMatchPct >= 70 ? 'B' : adjustedMatchPct >= 55 ? 'C' : adjustedMatchPct >= 40 ? 'D' : 'F',
       scoreBreakdown: scoring,
     });
   });
 
-  // Sort by match percentage (best first)
-  scoredComps.sort((a, b) => b.matchPct - a.matchPct);
+  // Sort by match percentage (best first), then by verified price source
+  scoredComps.sort((a, b) => {
+    // First by match %
+    if (b.matchPct !== a.matchPct) return b.matchPct - a.matchPct;
+    // Tiebreak: prefer verified prices
+    const aVerified = a._priceSource && (a._priceSource.includes('sold') || a._priceSource.includes('pending'));
+    const bVerified = b._priceSource && (b._priceSource.includes('sold') || b._priceSource.includes('pending'));
+    if (aVerified && !bVerified) return -1;
+    if (bVerified && !aVerified) return 1;
+    return 0;
+  });
 
-  // Calculate ARV from top comps (grade A or B, or top 5)
-  const topComps = scoredComps.filter(c => c.grade === 'A' || c.grade === 'B').slice(0, 5);
-  const arvComps = topComps.length >= 3 ? topComps : scoredComps.slice(0, 5);
+  // Calculate ARV from top comps — prefer verified-price comps
+  const verifiedComps = scoredComps.filter(c => c._priceSource && (c._priceSource.includes('sold') || c._priceSource.includes('pending') || c._priceSource.includes('lastSoldPrice') || c._priceSource.includes('soldPrice')));
+  const topComps = verifiedComps.length >= 3 ? verifiedComps.slice(0, 6) :
+    scoredComps.filter(c => c.grade === 'A' || c.grade === 'B').slice(0, 6);
+  const arvComps = topComps.length >= 3 ? topComps : scoredComps.slice(0, 6);
   const arvPrices = arvComps.map(c => c.price).filter(p => p > 0);
   const avgARV = arvPrices.length > 0 ? Math.round(arvPrices.reduce((a, b) => a + b, 0) / arvPrices.length) : null;
-  const medianARV = arvPrices.length > 0 ? arvPrices.sort((a, b) => a - b)[Math.floor(arvPrices.length / 2)] : null;
+  const medianARV = arvPrices.length > 0 ? [...arvPrices].sort((a, b) => a - b)[Math.floor(arvPrices.length / 2)] : null;
 
   return {
     subject: subject,
     comps: scoredComps,
     compCount: scoredComps.length,
-    totalExtracted: extractedProperties.length,
-    zpidsFetched: zpidsToFetch.length,
+    totalExtracted: allExtracted.length,
+    zpidsFetched: Math.min(zpidsToFetch.length, maxFetch),
     fullDataCount: fullDataProps.length,
-    daysBack: daysBack || 90,
+    searchExtractedCount: searchExtracted.length,
+    daysBack: daysBack || 180,
     suggestedARV: avgARV,
     medianARV: medianARV,
     arvCompsUsed: arvComps.length,
+    verifiedPriceComps: verifiedComps.length,
     zestimate: subject.zestimate,
     generatedAt: new Date().toISOString(),
     _debug: {
       topLevelKeys: Object.keys(propertyData || {}),
-      extractedRaw: extractedProperties.length,
-      extractedWithZpid: extractedProperties.filter(e => e.zpid).length,
-      extractedWithSoldPrice: extractedProperties.filter(e => e.soldPrice || e.lastSoldPrice || e.lastSalePrice).length,
-      extractedWithPriceHistory: extractedProperties.filter(e => Array.isArray(e.priceHistory) && e.priceHistory.length > 0).length,
-      extractedWithGenericPrice: extractedProperties.filter(e => e.price && !e.soldPrice && !e.lastSoldPrice && !e.lastSalePrice).length,
+      extractedFromSubject: extractedProperties.length,
+      extractedFromSearch: searchExtracted.length,
+      totalExtracted: allExtracted.length,
+      extractedWithZpid: allExtracted.filter(e => e.zpid).length,
+      extractedWithSoldPrice: allExtracted.filter(e => e.soldPrice || e.lastSoldPrice || e.lastSalePrice).length,
+      extractedWithPriceHistory: allExtracted.filter(e => Array.isArray(e.priceHistory) && e.priceHistory.length > 0).length,
+      extractedWithGenericPrice: allExtracted.filter(e => e.price && !e.soldPrice && !e.lastSoldPrice && !e.lastSalePrice).length,
       zpidsQueuedForFetch: zpidsToFetch.length,
-      zpidsFetchedCount: Math.min(zpidsToFetch.length, 15),
-      directToFullData: fullDataProps.length - Math.min(zpidsToFetch.length, 15),
+      zpidsFetchedCount: Math.min(zpidsToFetch.length, maxFetch),
       fullDataAfterFetch: fullDataProps.length,
       fullDataWithPriceHistory: fullDataProps.filter(f => Array.isArray(f.priceHistory) && f.priceHistory.length > 0).length,
+      verifiedPriceComps: verifiedComps.length,
       filteredOut: fullDataProps.length - scoredComps.length,
       compPriceSources: scoredComps.reduce((acc, c) => { acc[c._priceSource] = (acc[c._priceSource] || 0) + 1; return acc; }, {}),
-      // Sample of what's in extracted (first 3) for debugging
-      extractedSample: extractedProperties.slice(0, 3).map(e => ({
+      extractedSample: allExtracted.slice(0, 5).map(e => ({
         zpid: e.zpid || null,
         address: (e.address || e.streetAddress || '').toString().substring(0, 50),
         soldPrice: e.soldPrice || null,
         lastSoldPrice: e.lastSoldPrice || null,
         price: e.price || null,
+        zestimate: e.zestimate || null,
         homeStatus: e.homeStatus || e.statusType || null,
         hasPriceHistory: Array.isArray(e.priceHistory) && e.priceHistory.length > 0,
       })),
