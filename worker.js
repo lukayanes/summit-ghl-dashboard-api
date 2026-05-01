@@ -492,7 +492,8 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
   if (cached) return cached;
 
   // Redfin GIS-CSV endpoint parameters:
-  // status=9 = sold, uipt=1,2,3 = house/condo/townhouse, sf=1,2,3,5,6,7 = standard filters
+  // status=9 = sold, status=130 = sold+pending
+  // uipt=1,2,3,4 = house/condo/townhouse/multi, sf=1,2,3,5,6,7 = standard filters
   // sold_within_days limits recency
   const params = new URLSearchParams({
     al: '1',
@@ -570,6 +571,7 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
     const iLng = col(['longitude']);
     const iUrl = col(['url']);
     const iListPrice = col(['list price']);
+    const iStatus = col(['status', 'sale type']);
 
     const properties = [];
 
@@ -583,11 +585,26 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
       const zip = iZip >= 0 ? vals[iZip] : '';
       const fullAddr = addr + (city ? ', ' + city : '') + (state ? ', ' + state : '') + (zip ? ' ' + zip : '');
 
-      const price = iPrice >= 0 ? parseFloat((vals[iPrice] || '').replace(/[$,]/g, '')) : 0;
-      if (!price || price < 10000) continue; // skip no-price or rental-like
-
+      const rawStatus = iStatus >= 0 ? (vals[iStatus] || '').toLowerCase() : '';
       const soldDate = iSoldDate >= 0 ? vals[iSoldDate] : null;
       const listPrice = iListPrice >= 0 ? parseFloat((vals[iListPrice] || '').replace(/[$,]/g, '')) : null;
+
+      // Price extraction: use PRICE column first, fall back to LIST PRICE for pending
+      let price = iPrice >= 0 ? parseFloat((vals[iPrice] || '').replace(/[$,]/g, '')) : 0;
+      if ((!price || price < 10000) && listPrice && listPrice >= 10000) {
+        price = listPrice; // use list price for pending properties
+      }
+      if (!price || price < 10000) continue; // skip no-price or rental-like
+
+      // Determine price source based on status and date
+      let priceSource = 'redfin:price';
+      if (soldDate) {
+        priceSource = 'redfin:sold';
+      } else if (rawStatus.includes('pending') || rawStatus.includes('contingent')) {
+        priceSource = 'redfin:pending';
+      } else if (rawStatus.includes('sold')) {
+        priceSource = 'redfin:sold';
+      }
 
       properties.push({
         address: fullAddr,
@@ -607,12 +624,13 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
         latitude: iLat >= 0 ? parseFloat(vals[iLat]) || null : null,
         longitude: iLng >= 0 ? parseFloat(vals[iLng]) || null : null,
         redfinUrl: iUrl >= 0 ? vals[iUrl] : null,
+        redfinStatus: rawStatus || null,
         _source: 'redfin',
-        _priceSource: soldDate ? 'redfin:sold' : 'redfin:price',
+        _priceSource: priceSource,
       });
     }
 
-    const result = { properties, totalResults: properties.length, searchRadius: radiusMiles };
+    const result = { properties, totalResults: properties.length, searchRadius: radiusMiles, _headers: headers.slice(0, 20) };
     setZillowCache(cacheKey, result);
     return result;
 
@@ -1516,7 +1534,7 @@ async function findComps(address, daysBack, env) {
   if (subject.latitude && subject.longitude) {
     try {
       // Search 0.75 mile radius — typically covers the subdivision without crossing arterials
-      redfinResults = await redfinSearchSold(subject.latitude, subject.longitude, 0.75, daysBack || 180);
+      redfinResults = await redfinSearchSold(subject.latitude, subject.longitude, 1.0, daysBack || 180);
       if (redfinResults.error) redfinError = redfinResults.error;
     } catch (e) {
       redfinError = e.message;
@@ -1779,6 +1797,14 @@ async function findComps(address, daysBack, env) {
         homeStatus: e.homeStatus || e.statusType || null,
         hasPriceHistory: Array.isArray(e.priceHistory) && e.priceHistory.length > 0,
       })),
+      redfinSample: redfinProps.slice(0, 10).map(r => ({
+        address: (r.streetAddress || r.address || '').toString().substring(0, 50),
+        price: r.price || null,
+        soldDate: r.soldDate || null,
+        status: r.redfinStatus || null,
+        src: r._priceSource || null,
+      })),
+      redfinHeaders: redfinResults._headers || null,
     },
   };
 }
@@ -1991,54 +2017,140 @@ export default {
         }
       }
 
-      // Redfin photo scraper — fetches listing page and extracts photo URLs
+      // Redfin photo loader — uses Redfin's internal stingray API for reliable photo extraction
       if (pathname === '/api/redfin/photos') {
         const redfinUrl = url.searchParams.get('url');
         if (!redfinUrl) return errorResponse('url parameter required (Redfin listing URL)');
         try {
-          const resp = await fetch(redfinUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-            },
-          });
-          if (!resp.ok) throw new Error('Redfin returned ' + resp.status);
-          const html = await resp.text();
+          // Extract property ID from Redfin URL (last numeric segment)
+          const pidMatch = redfinUrl.match(/\/(\d+)(?:\/|$|\?)/);
+          if (!pidMatch) throw new Error('Could not extract property ID from URL: ' + redfinUrl);
+          const propertyId = pidMatch[1];
 
-          // Extract photo URLs from Redfin page HTML
+          // Extract the path portion for initialInfo
+          const urlPath = new URL(redfinUrl).pathname;
+
           const photoUrls = [];
           const seenUrls = new Set();
+          let apiSuccess = false;
 
-          // Method 1: Look for cdn-images in JSON-LD or initialRedfinData
-          const imgPatterns = [
-            /https:\/\/ssl\.cdn-redfin\.com\/photo\/[^"'\s)]+/g,
-            /https:\/\/photos\.redfin\.com\/[^"'\s)]+/g,
-            /https:\/\/ssl\.cdn-redfin\.com\/system_files\/media\/[^"'\s)]+/g,
-          ];
-          for (const pat of imgPatterns) {
-            const matches = html.match(pat) || [];
-            for (const m of matches) {
-              const clean = m.replace(/\\u002F/g, '/').replace(/\\/g, '');
-              if (!seenUrls.has(clean) && (clean.includes('.jpg') || clean.includes('.jpeg') || clean.includes('.png') || clean.includes('.webp') || clean.includes('photo'))) {
-                seenUrls.add(clean);
-                photoUrls.push(clean);
+          // Method 1: Try aboveTheFold API (has photos in mediaBrowserInfoByCategory)
+          try {
+            const atfResp = await fetch('https://www.redfin.com/stingray/api/home/details/aboveTheFold?propertyId=' + propertyId + '&accessLevel=1', {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Referer': 'https://www.redfin.com/',
+              },
+            });
+            if (atfResp.ok) {
+              let atfText = await atfResp.text();
+              // Redfin API responses start with {}&&  prefix — strip it
+              atfText = atfText.replace(/^\s*\{\}\s*&&\s*/, '');
+              const atfData = JSON.parse(atfText);
+
+              // Extract photos from mediaBrowserInfoByCategory
+              function extractRedfinPhotos(obj, depth) {
+                if (!obj || depth > 8) return;
+                if (typeof obj === 'string') {
+                  if ((obj.includes('ssl.cdn-redfin.com') || obj.includes('photos.redfin.com')) && obj.startsWith('http') && !seenUrls.has(obj)) {
+                    seenUrls.add(obj);
+                    photoUrls.push(obj);
+                  }
+                  return;
+                }
+                if (Array.isArray(obj)) { obj.forEach(item => extractRedfinPhotos(item, depth + 1)); return; }
+                if (typeof obj === 'object') {
+                  // Prefer photoUrl or photoDisplayUrl fields
+                  for (const key of ['photoDisplayUrl', 'photoUrl', 'photoUrlHiRes', 'fullUrl', 'url']) {
+                    if (obj[key] && typeof obj[key] === 'string' && obj[key].startsWith('http') && !seenUrls.has(obj[key])) {
+                      seenUrls.add(obj[key]);
+                      photoUrls.push(obj[key]);
+                    }
+                  }
+                  Object.values(obj).forEach(val => extractRedfinPhotos(val, depth + 1));
+                }
               }
+              extractRedfinPhotos(atfData, 0);
+              if (photoUrls.length > 0) apiSuccess = true;
             }
+          } catch (e) { /* aboveTheFold failed, try next method */ }
+
+          // Method 2: Try initialInfo API
+          if (!apiSuccess) {
+            try {
+              const iiResp = await fetch('https://www.redfin.com/stingray/api/home/details/initialInfo?path=' + encodeURIComponent(urlPath), {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': '*/*',
+                  'Referer': 'https://www.redfin.com/',
+                },
+              });
+              if (iiResp.ok) {
+                let iiText = await iiResp.text();
+                iiText = iiText.replace(/^\s*\{\}\s*&&\s*/, '');
+                const iiData = JSON.parse(iiText);
+                function extractRedfinPhotos2(obj, depth) {
+                  if (!obj || depth > 8) return;
+                  if (typeof obj === 'string') {
+                    if ((obj.includes('ssl.cdn-redfin.com') || obj.includes('photos.redfin.com')) && obj.startsWith('http') && !seenUrls.has(obj)) {
+                      seenUrls.add(obj);
+                      photoUrls.push(obj);
+                    }
+                    return;
+                  }
+                  if (Array.isArray(obj)) { obj.forEach(item => extractRedfinPhotos2(item, depth + 1)); return; }
+                  if (typeof obj === 'object') {
+                    for (const key of ['photoDisplayUrl', 'photoUrl', 'photoUrlHiRes', 'fullUrl', 'url']) {
+                      if (obj[key] && typeof obj[key] === 'string' && obj[key].startsWith('http') && !seenUrls.has(obj[key])) {
+                        seenUrls.add(obj[key]);
+                        photoUrls.push(obj[key]);
+                      }
+                    }
+                    Object.values(obj).forEach(val => extractRedfinPhotos2(val, depth + 1));
+                  }
+                }
+                extractRedfinPhotos2(iiData, 0);
+                if (photoUrls.length > 0) apiSuccess = true;
+              }
+            } catch (e) { /* initialInfo failed too */ }
           }
 
-          // Method 2: Look for og:image meta tag as fallback
-          const ogMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-          if (ogMatch && ogMatch[1] && !seenUrls.has(ogMatch[1])) {
-            seenUrls.add(ogMatch[1]);
-            photoUrls.unshift(ogMatch[1]); // put OG image first
+          // Method 3: Fallback — fetch listing page HTML and try regex extraction
+          if (!apiSuccess) {
+            try {
+              const htmlResp = await fetch(redfinUrl, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+              });
+              if (htmlResp.ok) {
+                const html = await htmlResp.text();
+                const imgPatterns = [
+                  /https:\/\/ssl\.cdn-redfin\.com\/photo\/[^"'\s)\\]+/g,
+                  /https:\/\/photos\.redfin\.com\/[^"'\s)\\]+/g,
+                ];
+                for (const pat of imgPatterns) {
+                  const matches = html.match(pat) || [];
+                  for (const m of matches) {
+                    const clean = m.replace(/\\u002F/g, '/');
+                    if (!seenUrls.has(clean)) { seenUrls.add(clean); photoUrls.push(clean); }
+                  }
+                }
+                // og:image fallback
+                const ogMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
+                if (ogMatch && ogMatch[1] && !seenUrls.has(ogMatch[1])) {
+                  photoUrls.unshift(ogMatch[1]);
+                }
+              }
+            } catch (e) { /* HTML fetch failed too */ }
           }
 
-          // Deduplicate keeping largest resolution variant per photo
+          // Deduplicate by base (removing size suffixes)
           const uniquePhotos = [];
           const photoBase = new Set();
           for (const pUrl of photoUrls) {
-            // Normalize by removing size suffixes like _w120_h90 or _292x218
             const base = pUrl.replace(/_w\d+_h\d+/g, '').replace(/_\d+x\d+/g, '').replace(/\?.*$/, '');
             if (!photoBase.has(base)) {
               photoBase.add(base);
@@ -2048,9 +2160,11 @@ export default {
 
           return jsonResponse({
             url: redfinUrl,
+            propertyId: propertyId,
             photos: uniquePhotos.slice(0, 30),
             photoCount: uniquePhotos.length,
             source: 'redfin',
+            method: apiSuccess ? 'api' : (uniquePhotos.length > 0 ? 'html' : 'none'),
           });
         } catch (e) {
           return jsonResponse({ url: redfinUrl, photos: [], photoCount: 0, error: e.message, source: 'redfin' });
