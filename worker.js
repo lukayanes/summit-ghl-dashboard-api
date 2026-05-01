@@ -675,6 +675,157 @@ function parseCSVRow(row) {
   return result;
 }
 
+// ==================== REALTOR.COM API (RapidAPI) ====================
+
+const REALTOR_API_HOST = 'realtor-com-open.p.rapidapi.com';
+
+/**
+ * Make authenticated request to Realtor.com Open API on RapidAPI
+ */
+async function realtorRequest(path, env) {
+  // Realtor.com and Zillow share the same RapidAPI key — use either
+  const apiKey = env.REALTOR_API_KEY || env.ZILLOW_API_KEY;
+  if (!apiKey) {
+    throw new Error('No RapidAPI key configured (need REALTOR_API_KEY or ZILLOW_API_KEY)');
+  }
+
+  const url = `https://${REALTOR_API_HOST}${path}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'x-rapidapi-key': apiKey,
+      'x-rapidapi-host': REALTOR_API_HOST,
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Realtor API error: ${response.status} ${response.statusText} - ${text.substring(0, 200)}`);
+  }
+
+  return await response.json();
+}
+
+/**
+ * Search Realtor.com for recently sold properties by location (city+state or zip)
+ * Returns normalized array of property objects compatible with the comp pipeline.
+ *
+ * @param {string} location - e.g. "Wichita, KS" or "67217"
+ * @param {number} limit - max results (default 42)
+ */
+async function realtorSearchSold(location, limit = 42) {
+  // Note: env is not needed here — caller passes it through realtorRequest
+  // This is a wrapper that normalizes the response
+  const encoded = encodeURIComponent(location);
+  const path = `/search/properties?location=${encoded}&status=sold&limit=${limit}`;
+  return path; // return the path for the caller to fetch
+}
+
+/**
+ * Search Realtor.com sold properties and normalize results for comp pipeline
+ */
+async function realtorFindSoldComps(location, subjectLat, subjectLng, radiusMiles, env) {
+  const apiKey = env.REALTOR_API_KEY || env.ZILLOW_API_KEY;
+  if (!apiKey) return { properties: [], error: 'No RapidAPI key configured' };
+
+  const cacheKey = 'realtor_sold_' + location;
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const encoded = encodeURIComponent(location);
+    const data = await realtorRequest(`/search/properties?location=${encoded}&status=sold&limit=42`, env);
+
+    const props = data?.home_search?.properties || data?.properties || [];
+    const normalized = [];
+
+    props.forEach(p => {
+      if (!p) return;
+
+      const addr = p.location?.address || {};
+      const streetAddress = addr.line || '';
+      const city = addr.city || '';
+      const stateCode = addr.state_code || addr.state || '';
+      const zip = addr.postal_code || '';
+      const fullAddress = streetAddress + (city ? ', ' + city : '') + (stateCode ? ', ' + stateCode : '') + (zip ? ' ' + zip : '');
+
+      // Extract coordinates
+      const lat = p.location?.coordinate?.lat || p.latitude || null;
+      const lng = p.location?.coordinate?.lon || p.location?.coordinate?.lng || p.longitude || null;
+
+      // Distance filter if we have coordinates
+      let distance = null;
+      if (subjectLat && subjectLng && lat && lng) {
+        distance = haversineDistance(subjectLat, subjectLng, lat, lng);
+        if (distance > (radiusMiles || 2)) return; // skip if too far
+      }
+
+      // Extract price — sold price or list price
+      const price = p.sold_price || p.last_sold_price || p.list_price || p.price || 0;
+      if (price <= 0 || price < 10000) return;
+
+      // Extract sold date
+      const soldDate = p.sold_date || p.last_sold_date || p.date_sold || null;
+
+      // Extract photos
+      const photos = [];
+      if (Array.isArray(p.photos)) {
+        p.photos.forEach(photo => {
+          if (typeof photo === 'string') photos.push(photo);
+          else if (photo?.href) photos.push(photo.href);
+          else if (photo?.url) photos.push(photo.url);
+        });
+      }
+      if (p.primary_photo?.href) photos.unshift(p.primary_photo.href);
+
+      normalized.push({
+        streetAddress: fullAddress,
+        address: fullAddress,
+        price: price,
+        bedrooms: p.description?.beds || p.beds || null,
+        bathrooms: p.description?.baths || p.baths || null,
+        livingArea: p.description?.sqft || p.sqft || p.building_size?.size || null,
+        lotSize: p.description?.lot_sqft || p.lot_size?.size || p.lot_sqft || null,
+        yearBuilt: p.description?.year_built || p.year_built || null,
+        propertyType: p.description?.type || p.prop_type || p.property_type || null,
+        homeStatus: 'sold',
+        soldDate: soldDate,
+        latitude: lat,
+        longitude: lng,
+        _distance: distance,
+        imgSrc: photos.length > 0 ? photos[0] : null,
+        _photos: photos,
+        _source: 'realtor',
+        _priceSource: p.sold_price ? 'realtor:sold' : p.last_sold_price ? 'realtor:lastSold' : 'realtor:listPrice',
+        _realtorPropertyId: p.property_id || null,
+      });
+    });
+
+    const result = { properties: normalized, total: props.length, normalized: normalized.length };
+    setZillowCache(cacheKey, result);
+    return result;
+  } catch (e) {
+    return { properties: [], error: e.message };
+  }
+}
+
+/**
+ * Get Realtor.com property details by property_id
+ */
+async function realtorGetPropertyDetails(propertyId, env) {
+  const apiKey = env.REALTOR_API_KEY || env.ZILLOW_API_KEY;
+  if (!apiKey) throw new Error('No RapidAPI key configured');
+
+  const cacheKey = 'realtor_detail_' + propertyId;
+  const cached = getZillowCache(cacheKey);
+  if (cached) return cached;
+
+  const data = await realtorRequest(`/property/details?property_id=${propertyId}`, env);
+  setZillowCache(cacheKey, data);
+  return data;
+}
+
 // ==================== RENTOMETER API ====================
 
 const RENTOMETER_BASE = 'https://www.rentometer.com/api/v1';
@@ -1480,9 +1631,9 @@ async function findComps(address, daysBack, env) {
     longitude: p.longitude || null,
     zestimate: p.zestimate || null,
     rentZestimate: p.rentZestimate || null,
-    zipcode: p.zipcode || p.zip || null,
-    city: p.city || null,
-    state: p.state || null,
+    zipcode: p.zipcode || p.zip || (typeof p.address === 'object' && p.address ? p.address.zipcode || p.address.zip : null) || null,
+    city: p.city || (typeof p.address === 'object' && p.address ? p.address.city : null) || null,
+    state: p.state || (typeof p.address === 'object' && p.address ? p.address.state : null) || null,
     imgSrc: p.imgSrc || p.streetViewTileImageUrlMediumAddress || (subjectPhotos.length > 0 ? subjectPhotos[0] : null),
     photos: subjectPhotos.slice(0, 30),
     lastSalePrice: lastSalePrice || null,
@@ -1555,6 +1706,44 @@ async function findComps(address, daysBack, env) {
     fullDataProps.push(rp);
   });
 
+  // === REALTOR.COM: Search for sold comps via Realtor.com API ===
+  let realtorResults = { properties: [] };
+  let realtorError = null;
+  let realtorCompsAdded = 0;
+
+  if (env.REALTOR_API_KEY || env.ZILLOW_API_KEY) {
+    try {
+      // Build location string from subject's city/state or zip
+      const realtorLocation = (subject.city && subject.state)
+        ? `${subject.city}, ${subject.state}`
+        : (subject.zipcode || address);
+
+      realtorResults = await realtorFindSoldComps(
+        realtorLocation,
+        subject.latitude,
+        subject.longitude,
+        1.5, // slightly wider radius to catch more — will be distance-filtered in scoring
+        env
+      );
+
+      if (realtorResults.error) realtorError = realtorResults.error;
+
+      // Add Realtor.com results, deduplicating against Redfin
+      const realtorProps = realtorResults.properties || [];
+      realtorProps.forEach(rp => {
+        const normAddr = String(rp.streetAddress || rp.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const subjectNorm = String(subject.address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (normAddr === subjectNorm) return;
+        if (seenAddresses.has(normAddr)) return;
+        seenAddresses.add(normAddr);
+        fullDataProps.push(rp);
+        realtorCompsAdded++;
+      });
+    } catch (e) {
+      realtorError = e.message;
+    }
+  }
+
   // === FALLBACK: Also use ZLLW embedded properties ===
   // Fetch zpids from ZLLW response individually to get priceHistory
   // (may find comps that Redfin missed, or enrich with Zillow photos/zpids)
@@ -1618,6 +1807,13 @@ async function findComps(address, daysBack, env) {
     if (comp._source === 'redfin' && comp.price > 0) {
       price = comp.price;
       priceSource = comp._priceSource || 'redfin:sold';
+      if (!soldDateStr && comp.soldDate) soldDateStr = comp.soldDate;
+    }
+
+    // REALTOR.COM FAST-PATH: Realtor comps already have pre-extracted prices & dates
+    if (comp._source === 'realtor' && comp.price > 0) {
+      price = comp.price;
+      priceSource = comp._priceSource || 'realtor:sold';
       if (!soldDateStr && comp.soldDate) soldDateStr = comp.soldDate;
     }
 
@@ -1726,6 +1922,9 @@ async function findComps(address, daysBack, env) {
       zpid: comp.zpid || null,
       redfinUrl: comp.redfinUrl || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
+      _photos: comp._photos || null,
+      _realtorPropertyId: comp._realtorPropertyId || null,
+      _dataSource: comp._source || (comp.zpid ? 'zillow' : 'unknown'),
       _priceSource: priceSource || 'unknown',
       matchPct: adjustedMatchPct,
       grade: adjustedMatchPct >= 85 ? 'A' : adjustedMatchPct >= 70 ? 'B' : adjustedMatchPct >= 55 ? 'C' : adjustedMatchPct >= 40 ? 'D' : 'F',
@@ -1762,6 +1961,7 @@ async function findComps(address, daysBack, env) {
     zpidsFetched: fetchedZpids.size,
     fullDataCount: fullDataProps.length,
     redfinCompsFound: redfinProps.length,
+    realtorCompsFound: realtorCompsAdded,
     daysBack: daysBack || 180,
     suggestedARV: avgARV,
     medianARV: medianARV,
@@ -1806,6 +2006,15 @@ async function findComps(address, daysBack, env) {
         src: r._priceSource || null,
       })),
       redfinHeaders: redfinResults._headers || null,
+      realtorResults: realtorCompsAdded,
+      realtorError: realtorError,
+      realtorTotal: realtorResults.total || 0,
+      realtorSample: (realtorResults.properties || []).slice(0, 5).map(r => ({
+        address: (r.streetAddress || r.address || '').toString().substring(0, 50),
+        price: r.price || null,
+        soldDate: r.soldDate || null,
+        src: r._priceSource || null,
+      })),
     },
   };
 }
@@ -2079,6 +2288,77 @@ export default {
       // (Redfin blocks server-side page fetches from Cloudflare Workers)
       if (pathname === '/api/redfin/photos') {
         return jsonResponse({ photos: [], photoCount: 0, error: 'Use /api/zillow/photos-by-address instead', source: 'redfin' });
+      }
+
+      // Realtor.com: Search sold properties by location
+      if (pathname === '/api/realtor/search') {
+        const location = url.searchParams.get('location');
+        if (!location) return errorResponse('location parameter required');
+        if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+        try {
+          const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(location)}&status=sold&limit=42`, env);
+          return jsonResponse(data);
+        } catch (e) {
+          return errorResponse('Realtor search failed: ' + e.message, 500);
+        }
+      }
+
+      // Realtor.com: Get property details by property_id
+      if (pathname === '/api/realtor/details') {
+        const propertyId = url.searchParams.get('property_id');
+        if (!propertyId) return errorResponse('property_id parameter required');
+        if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+        try {
+          const data = await realtorGetPropertyDetails(propertyId, env);
+          return jsonResponse(data);
+        } catch (e) {
+          return errorResponse('Realtor detail failed: ' + e.message, 500);
+        }
+      }
+
+      // Realtor.com: Get photos for a property by property_id
+      if (pathname === '/api/realtor/photos') {
+        const propertyId = url.searchParams.get('property_id');
+        const address = url.searchParams.get('address');
+        if (!propertyId && !address) return errorResponse('property_id or address parameter required');
+        if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+        try {
+          let photos = [];
+          if (propertyId) {
+            // Fetch details for this property_id to get photos
+            const data = await realtorGetPropertyDetails(propertyId, env);
+            const p = data?.home || data?.property || data || {};
+            if (Array.isArray(p.photos)) {
+              p.photos.forEach(photo => {
+                if (typeof photo === 'string') photos.push(photo);
+                else if (photo?.href) photos.push(photo.href);
+                else if (photo?.url) photos.push(photo.url);
+              });
+            }
+            return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor' });
+          } else if (address) {
+            // Search by address location to find matching property + photos
+            const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(address)}&status=sold&limit=5`, env);
+            const props = data?.home_search?.properties || data?.properties || [];
+            // Try to find matching property
+            const normSearch = address.toLowerCase().replace(/[^a-z0-9]/g, '');
+            let matched = props.find(p => {
+              const addr = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+              return addr && normSearch.includes(addr);
+            }) || props[0];
+            if (matched && Array.isArray(matched.photos)) {
+              matched.photos.forEach(photo => {
+                if (typeof photo === 'string') photos.push(photo);
+                else if (photo?.href) photos.push(photo.href);
+                else if (photo?.url) photos.push(photo.url);
+              });
+            }
+            if (matched?.primary_photo?.href) photos.unshift(matched.primary_photo.href);
+            return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null });
+          }
+        } catch (e) {
+          return jsonResponse({ photos: [], photoCount: 0, error: e.message, source: 'realtor' });
+        }
       }
 
       if (pathname === '/api/zillow/lookup') {
