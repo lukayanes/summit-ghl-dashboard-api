@@ -1991,6 +1991,72 @@ export default {
         }
       }
 
+      // Redfin photo scraper — fetches listing page and extracts photo URLs
+      if (pathname === '/api/redfin/photos') {
+        const redfinUrl = url.searchParams.get('url');
+        if (!redfinUrl) return errorResponse('url parameter required (Redfin listing URL)');
+        try {
+          const resp = await fetch(redfinUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+            },
+          });
+          if (!resp.ok) throw new Error('Redfin returned ' + resp.status);
+          const html = await resp.text();
+
+          // Extract photo URLs from Redfin page HTML
+          const photoUrls = [];
+          const seenUrls = new Set();
+
+          // Method 1: Look for cdn-images in JSON-LD or initialRedfinData
+          const imgPatterns = [
+            /https:\/\/ssl\.cdn-redfin\.com\/photo\/[^"'\s)]+/g,
+            /https:\/\/photos\.redfin\.com\/[^"'\s)]+/g,
+            /https:\/\/ssl\.cdn-redfin\.com\/system_files\/media\/[^"'\s)]+/g,
+          ];
+          for (const pat of imgPatterns) {
+            const matches = html.match(pat) || [];
+            for (const m of matches) {
+              const clean = m.replace(/\\u002F/g, '/').replace(/\\/g, '');
+              if (!seenUrls.has(clean) && (clean.includes('.jpg') || clean.includes('.jpeg') || clean.includes('.png') || clean.includes('.webp') || clean.includes('photo'))) {
+                seenUrls.add(clean);
+                photoUrls.push(clean);
+              }
+            }
+          }
+
+          // Method 2: Look for og:image meta tag as fallback
+          const ogMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
+          if (ogMatch && ogMatch[1] && !seenUrls.has(ogMatch[1])) {
+            seenUrls.add(ogMatch[1]);
+            photoUrls.unshift(ogMatch[1]); // put OG image first
+          }
+
+          // Deduplicate keeping largest resolution variant per photo
+          const uniquePhotos = [];
+          const photoBase = new Set();
+          for (const pUrl of photoUrls) {
+            // Normalize by removing size suffixes like _w120_h90 or _292x218
+            const base = pUrl.replace(/_w\d+_h\d+/g, '').replace(/_\d+x\d+/g, '').replace(/\?.*$/, '');
+            if (!photoBase.has(base)) {
+              photoBase.add(base);
+              uniquePhotos.push(pUrl);
+            }
+          }
+
+          return jsonResponse({
+            url: redfinUrl,
+            photos: uniquePhotos.slice(0, 30),
+            photoCount: uniquePhotos.length,
+            source: 'redfin',
+          });
+        } catch (e) {
+          return jsonResponse({ url: redfinUrl, photos: [], photoCount: 0, error: e.message, source: 'redfin' });
+        }
+      }
+
       if (pathname === '/api/zillow/lookup') {
         const address = url.searchParams.get('address');
         if (!address) return errorResponse('address parameter required');
