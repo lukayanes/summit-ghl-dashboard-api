@@ -1724,6 +1724,7 @@ async function findComps(address, daysBack, env) {
       longitude: comp.longitude || null,
       distance: distance ? Math.round(distance * 100) / 100 : null,
       zpid: comp.zpid || null,
+      redfinUrl: comp.redfinUrl || null,
       imgSrc: comp.imgSrc || comp.miniCardPhotos?.[0]?.url || null,
       _priceSource: priceSource || 'unknown',
       matchPct: adjustedMatchPct,
@@ -2017,177 +2018,67 @@ export default {
         }
       }
 
-      // Redfin photo loader — multi-method extraction with full error tracking
-      if (pathname === '/api/redfin/photos') {
-        const redfinUrl = url.searchParams.get('url');
-        if (!redfinUrl) return errorResponse('url parameter required (Redfin listing URL)');
-
-        const photoUrls = [];
-        const seenUrls = new Set();
-        const methodLog = [];
-        let propertyId = null;
-
+      // Look up property by address on Zillow and return photos + zpid
+      // Used as fallback for Redfin-only comps that have no zpid
+      if (pathname === '/api/zillow/photos-by-address') {
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
         try {
-          // Extract property ID from Redfin URL (last numeric segment before end/slash/query)
-          const pidMatch = redfinUrl.match(/\/(\d{5,})(?:\/|$|\?)/);
-          if (pidMatch) propertyId = pidMatch[1];
+          // Look up property by address
+          const data = await zillowGetByAddress(address, env);
+          const p = data?.propertyDetails || data?.data || data || {};
+          const zpid = p.zpid || null;
 
-          // ===== METHOD 1: Fetch listing page HTML =====
-          // Redfin SSR pages embed data in script tags and structured data
-          try {
-            const htmlResp = await fetch(redfinUrl, {
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip',
-                'Cache-Control': 'no-cache',
-              },
-              redirect: 'follow',
-            });
-            methodLog.push('html:status=' + htmlResp.status);
-
-            if (htmlResp.ok) {
-              const html = await htmlResp.text();
-              methodLog.push('html:length=' + html.length);
-
-              // Strategy A: JSON-LD structured data (most reliable — always present for SEO)
-              const ldMatches = html.match(/<script\s+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi) || [];
-              for (const ldBlock of ldMatches) {
-                const jsonStr = ldBlock.replace(/<script[^>]*>/i, '').replace(/<\/script>/i, '').trim();
-                try {
-                  const ld = JSON.parse(jsonStr);
-                  // SingleFamilyResidence or similar has "photo" array
-                  const extractLdPhotos = (obj) => {
-                    if (!obj) return;
-                    if (typeof obj === 'string' && obj.startsWith('http') && (obj.includes('redfin') || obj.includes('.jpg') || obj.includes('.jpeg') || obj.includes('.png') || obj.includes('.webp'))) {
-                      if (!seenUrls.has(obj)) { seenUrls.add(obj); photoUrls.push(obj); }
-                    }
-                    if (Array.isArray(obj)) obj.forEach(extractLdPhotos);
-                    if (typeof obj === 'object' && obj !== null) {
-                      for (const key of ['image', 'photo', 'url', 'contentUrl', 'thumbnailUrl']) {
-                        if (obj[key]) extractLdPhotos(obj[key]);
-                      }
-                      if (obj['@graph']) extractLdPhotos(obj['@graph']);
-                    }
-                  };
-                  extractLdPhotos(ld);
-                } catch (e) { /* invalid JSON-LD block */ }
+          // Extract photos
+          const photoUrls = [];
+          const seenUrls = new Set();
+          function extractAddrPhotos(obj, depth) {
+            if (!obj || depth > 5) return;
+            if (typeof obj === 'string') {
+              if ((obj.includes('zillowstatic.com') || obj.includes('.jpg') || obj.includes('.jpeg') || obj.includes('.png') || obj.includes('.webp')) && obj.startsWith('http') && !seenUrls.has(obj)) {
+                seenUrls.add(obj);
+                photoUrls.push(obj);
               }
-              if (photoUrls.length > 0) methodLog.push('json-ld:' + photoUrls.length);
-
-              // Strategy B: og:image meta tag
-              const ogMatch = html.match(/<meta\s+(?:property|name)="og:image"\s+content="([^"]+)"/i)
-                           || html.match(/<meta\s+content="([^"]+)"\s+(?:property|name)="og:image"/i);
-              if (ogMatch && ogMatch[1] && !seenUrls.has(ogMatch[1])) {
-                seenUrls.add(ogMatch[1]);
-                photoUrls.unshift(ogMatch[1]);
-                methodLog.push('og:image:1');
-              }
-
-              // Strategy C: Look for Redfin CDN photo URLs anywhere in the HTML
-              // These appear in inline scripts, data attributes, and SSR content
-              const cdnPatterns = [
-                /https?:\/\/ssl\.cdn-redfin\.com\/photo\/\d+\/(?:bigphoto|thumbphoto|genMid|genIs498)[^\s"'<>)\\]*/g,
-                /https?:\/\/ssl\.cdn-redfin\.com\/system_files\/media\/\d+\/\d+\/[^\s"'<>)\\]*/g,
-                /https?:\/\/photos\.redfin\.com\/[^\s"'<>)\\]*/g,
-              ];
-              for (const pat of cdnPatterns) {
-                const matches = html.match(pat) || [];
-                for (const m of matches) {
-                  const clean = m.replace(/\\u002F/g, '/').replace(/\\"/g, '').replace(/&amp;/g, '&');
-                  if (!seenUrls.has(clean) && clean.length > 30) {
-                    seenUrls.add(clean);
-                    photoUrls.push(clean);
-                  }
-                }
-              }
-              if (photoUrls.length > 0) methodLog.push('cdn-regex:' + photoUrls.length);
-
-              // Strategy D: Extract from __reactServerState or window.__NEXT_DATA__ JSON blobs
-              const jsonBlobPatterns = [
-                /window\.__reactServerState\s*=\s*(\{[\s\S]*?\});\s*<\/script>/,
-                /window\.__NEXT_DATA__\s*=\s*(\{[\s\S]*?\});\s*<\/script>/,
-                /"mediaModel"\s*:\s*(\{[\s\S]*?\})\s*[,}]/,
-              ];
-              for (const jp of jsonBlobPatterns) {
-                const jm = html.match(jp);
-                if (jm && jm[1]) {
-                  try {
-                    // Try to extract just photo URLs from the blob without full parse
-                    const blob = jm[1];
-                    const urlPattern = /https?:\/\/ssl\.cdn-redfin\.com\/photo\/[^"'\s\\]+/g;
-                    const blobMatches = blob.match(urlPattern) || [];
-                    for (const bu of blobMatches) {
-                      const clean = bu.replace(/\\u002F/g, '/').replace(/\\/g, '');
-                      if (!seenUrls.has(clean) && clean.length > 30) {
-                        seenUrls.add(clean);
-                        photoUrls.push(clean);
-                      }
-                    }
-                    if (blobMatches.length > 0) methodLog.push('json-blob:' + blobMatches.length);
-                  } catch (e) { /* blob parse failed */ }
-                }
-              }
+              return;
             }
-          } catch (e) {
-            methodLog.push('html:error=' + e.message);
+            if (Array.isArray(obj)) { obj.forEach(item => extractAddrPhotos(item, depth + 1)); return; }
+            if (typeof obj === 'object') {
+              if (obj.mixedSources) {
+                const jpegSrc = obj.mixedSources.jpeg || obj.mixedSources.webp || [];
+                if (Array.isArray(jpegSrc) && jpegSrc.length > 0) {
+                  const best = jpegSrc[jpegSrc.length - 1];
+                  if (best && best.url && !seenUrls.has(best.url)) { seenUrls.add(best.url); photoUrls.push(best.url); }
+                }
+              }
+              Object.values(obj).forEach(val => extractAddrPhotos(val, depth + 1));
+            }
           }
+          extractAddrPhotos(data, 0);
 
-          // ===== METHOD 2: Try Redfin stingray API (if HTML didn't yield photos) =====
-          if (photoUrls.length === 0 && propertyId) {
+          // If the address lookup didn't have many photos but we got a zpid, try zpid fetch
+          if (photoUrls.length <= 2 && zpid) {
             try {
-              const atfResp = await fetch('https://www.redfin.com/stingray/api/home/details/aboveTheFold?propertyId=' + propertyId + '&accessLevel=1', {
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                  'Accept': '*/*',
-                  'Referer': redfinUrl,
-                },
-              });
-              methodLog.push('atf:status=' + atfResp.status);
-              if (atfResp.ok) {
-                let atfText = await atfResp.text();
-                atfText = atfText.replace(/^\s*\{\}\s*&&\s*/, '');
-                // Extract CDN URLs from the JSON text directly (avoids deep parse issues)
-                const apiUrls = atfText.match(/https?:\/\/ssl\.cdn-redfin\.com\/photo\/[^"'\s\\]+/g) || [];
-                for (const au of apiUrls) {
-                  const clean = au.replace(/\\u002F/g, '/').replace(/\\/g, '');
-                  if (!seenUrls.has(clean) && clean.length > 30) {
-                    seenUrls.add(clean);
-                    photoUrls.push(clean);
-                  }
-                }
-                methodLog.push('atf:found=' + apiUrls.length);
-              }
-            } catch (e) {
-              methodLog.push('atf:error=' + e.message);
-            }
-          }
-
-          // Deduplicate by base (removing size suffixes), prefer larger versions
-          const uniquePhotos = [];
-          const photoBase = new Set();
-          for (const pUrl of photoUrls) {
-            const base = pUrl.replace(/_w\d+_h\d+/g, '').replace(/_\d+x\d+/g, '').replace(/\?.*$/, '').replace(/genMid|bigphoto|thumbphoto/, 'X');
-            if (!photoBase.has(base)) {
-              photoBase.add(base);
-              // Prefer bigphoto/genMid over thumbphoto
-              const upgraded = pUrl.replace(/thumbphoto/, 'bigphoto');
-              uniquePhotos.push(upgraded);
-            }
+              const zpidData = await zillowGetByZpid(zpid, env);
+              extractAddrPhotos(zpidData, 0);
+            } catch (e) { /* zpid fetch failed, use what we have */ }
           }
 
           return jsonResponse({
-            url: redfinUrl,
-            propertyId: propertyId,
-            photos: uniquePhotos.slice(0, 30),
-            photoCount: uniquePhotos.length,
-            source: 'redfin',
-            methodLog: methodLog,
+            address: address,
+            zpid: zpid,
+            photos: photoUrls,
+            photoCount: photoUrls.length,
           });
         } catch (e) {
-          return jsonResponse({ url: redfinUrl, photos: [], photoCount: 0, error: e.message, source: 'redfin', methodLog: methodLog });
+          return jsonResponse({ address, zpid: null, photos: [], photoCount: 0, error: e.message });
         }
+      }
+
+      // Legacy Redfin photo endpoint — redirects to Zillow address lookup
+      // (Redfin blocks server-side page fetches from Cloudflare Workers)
+      if (pathname === '/api/redfin/photos') {
+        return jsonResponse({ photos: [], photoCount: 0, error: 'Use /api/zillow/photos-by-address instead', source: 'redfin' });
       }
 
       if (pathname === '/api/zillow/lookup') {
@@ -2301,4 +2192,3 @@ export default {
     }
   },
 };
-          
