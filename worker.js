@@ -2430,14 +2430,40 @@ export default {
             debugInfo = { method: 'property_id', dataKeys: Object.keys(p).slice(0, 20), photosFieldType: typeof p.photos, photosIsArray: Array.isArray(p.photos), photosLength: Array.isArray(p.photos) ? p.photos.length : 0, primaryPhoto: p.primary_photo ? 'exists' : 'missing', samplePhoto: Array.isArray(p.photos) && p.photos[0] ? JSON.stringify(p.photos[0]).substring(0, 200) : 'none' };
             return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor', debug: debugInfo });
           } else if (address) {
-            // Search by address location to find matching property
-            const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(address)}&status=sold&limit=5`, env);
-            const props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
-            const normSearch = address.toLowerCase().replace(/[^a-z0-9]/g, '');
+            // Extract city+state or zip from the full address for the location search
+            // Address format: "112 S Masters Dr, Dallas, TX 75217"
+            const addrParts = address.split(',').map(s => s.trim());
+            let searchLocation = address; // fallback
+            if (addrParts.length >= 3) {
+              // "Dallas", "TX 75217" → "Dallas, TX 75217"
+              searchLocation = addrParts.slice(1).join(', ').trim();
+            } else if (addrParts.length === 2) {
+              // Maybe "Dallas, TX 75217"
+              searchLocation = addrParts[1].trim();
+            }
+            // Also try zip if present
+            const zipMatch = address.match(/\b(\d{5})\b/);
+            const searchZip = zipMatch ? zipMatch[1] : null;
+
+            // Try city+state first, fall back to zip
+            let props = [];
+            const tryLocations = [searchLocation];
+            if (searchZip && searchZip !== searchLocation) tryLocations.push(searchZip);
+
+            for (const loc of tryLocations) {
+              if (props.length > 0) break;
+              try {
+                const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(loc)}&status=sold&limit=20`, env);
+                props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
+              } catch (e) { /* try next location */ }
+            }
+
+            // Match by street address in results
+            const streetPart = addrParts[0] ? addrParts[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '';
             let matched = props.find(p => {
-              const addr = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-              return addr && normSearch.includes(addr);
-            }) || props[0];
+              const line = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+              return line && streetPart && (line.includes(streetPart) || streetPart.includes(line));
+            }) || null;
             if (matched) {
               photos = extractRealtorPhotos(matched);
               // If search only gives primary_photo, try details endpoint for full gallery
@@ -2450,7 +2476,7 @@ export default {
                 } catch(e2) {}
               }
             }
-            debugInfo = { method: 'address', propsFound: props.length, matchedId: matched?.property_id || null };
+            debugInfo = { method: 'address', searchLocation: tryLocations[0], propsFound: props.length, streetPart, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null };
             return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null, debug: debugInfo });
           }
         } catch (e) {
