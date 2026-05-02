@@ -2458,6 +2458,61 @@ export default {
         }
       }
 
+      // Realtor.com: raw API debug — returns full API response for inspection
+      if (pathname === '/api/realtor/debug') {
+        const endpoint = url.searchParams.get('endpoint') || '/search/properties';
+        const location = url.searchParams.get('location');
+        const property_id = url.searchParams.get('property_id');
+        if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+        try {
+          let path = endpoint;
+          if (location) path += (path.includes('?') ? '&' : '?') + 'location=' + encodeURIComponent(location);
+          if (property_id) path += (path.includes('?') ? '&' : '?') + 'property_id=' + property_id;
+          // Also add status=sold and limit if this is a search
+          if (endpoint.includes('search') && !path.includes('status=')) path += '&status=sold&limit=3';
+          const data = await realtorRequest(path, env);
+          // Extract keys at various levels for debugging
+          const topKeys = data ? Object.keys(data) : [];
+          let sampleProp = null;
+          const props = data?.home_search?.properties || data?.properties || data?.data?.home_search?.properties || [];
+          if (props.length > 0) {
+            const p = props[0];
+            sampleProp = {
+              _topKeys: Object.keys(p),
+              primary_photo: p.primary_photo || 'MISSING',
+              photos: p.photos ? { type: typeof p.photos, isArray: Array.isArray(p.photos), length: Array.isArray(p.photos) ? p.photos.length : 'N/A', sample: Array.isArray(p.photos) ? p.photos.slice(0, 2) : p.photos } : 'MISSING',
+              photo: p.photo ? { type: typeof p.photo, isArray: Array.isArray(p.photo), sample: Array.isArray(p.photo) ? p.photo.slice(0, 2) : p.photo } : 'MISSING',
+              media: p.media ? Object.keys(p.media) : 'MISSING',
+              thumbnail: p.thumbnail || 'MISSING',
+              property_id: p.property_id || 'MISSING',
+              location: p.location ? { address: p.location.address } : 'MISSING',
+            };
+          }
+          // For detail responses
+          let detailInfo = null;
+          const home = data?.home || data?.property;
+          if (home) {
+            detailInfo = {
+              _topKeys: Object.keys(home),
+              photos: home.photos ? { type: typeof home.photos, isArray: Array.isArray(home.photos), length: Array.isArray(home.photos) ? home.photos.length : 'N/A', sample: Array.isArray(home.photos) ? home.photos.slice(0, 2) : home.photos } : 'MISSING',
+              photo: home.photo ? { type: typeof home.photo, isArray: Array.isArray(home.photo), sample: Array.isArray(home.photo) ? home.photo.slice(0, 2) : home.photo } : 'MISSING',
+              primary_photo: home.primary_photo || 'MISSING',
+              media: home.media ? Object.keys(home.media) : 'MISSING',
+            };
+          }
+          return jsonResponse({
+            endpoint: path,
+            topLevelKeys: topKeys,
+            propsCount: props.length,
+            sampleProperty: sampleProp,
+            detailInfo: detailInfo,
+            rawResponse: JSON.stringify(data).substring(0, 3000),
+          });
+        } catch (e) {
+          return jsonResponse({ error: e.message, endpoint });
+        }
+      }
+
       if (pathname === '/api/zillow/lookup') {
         const address = url.searchParams.get('address');
         if (!address) return errorResponse('address parameter required');
