@@ -1386,7 +1386,7 @@ async function zillowFullLookup(address, env) {
     if (cZpid && seenCompZpids.has(cZpid)) return;
     if (cZpid) seenCompZpids.add(cZpid);
     comps.push({
-      address: (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') : null) || comp.streetAddress || comp.formattedAddress || comp.address || '',
+      address: (typeof comp.address === 'string' && comp.address.includes(',') ? comp.address : null) || (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') + (comp.address.state || comp.address.state_code ? ', ' + (comp.address.state || comp.address.state_code) : '') + (comp.address.zipcode || comp.address.postal_code ? ' ' + (comp.address.zipcode || comp.address.postal_code) : '') : null) || comp.formattedAddress || (comp.streetAddress ? (comp.streetAddress + (comp.city ? ', ' + comp.city : '') + (comp.state ? ', ' + comp.state : '') + (comp.zipcode ? ' ' + comp.zipcode : '')) : null) || comp.address || '',
       price: comp.soldPrice || comp.lastSoldPrice || comp.lastSalePrice || comp.salePrice || comp.price || 0,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
@@ -1989,7 +1989,7 @@ async function findComps(address, daysBack, env, radiusMiles = 1.0) {
     }
 
     scoredComps.push({
-      address: (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') : null) || comp.streetAddress || comp.formattedAddress || comp.address || '',
+      address: (typeof comp.address === 'string' && comp.address.includes(',') ? comp.address : null) || (typeof comp.address === 'object' && comp.address ? (comp.address.streetAddress || comp.address.street || '') + (comp.address.city ? ', ' + comp.address.city : '') + (comp.address.state || comp.address.state_code ? ', ' + (comp.address.state || comp.address.state_code) : '') + (comp.address.zipcode || comp.address.postal_code ? ' ' + (comp.address.zipcode || comp.address.postal_code) : '') : null) || comp.formattedAddress || (comp.streetAddress ? (comp.streetAddress + (comp.city ? ', ' + comp.city : '') + (comp.state ? ', ' + comp.state : '') + (comp.zipcode ? ' ' + comp.zipcode : '')) : null) || comp.address || '',
       price: price,
       bedrooms: comp.bedrooms || comp.beds || null,
       bathrooms: comp.bathrooms || comp.baths || null,
