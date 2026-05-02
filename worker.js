@@ -1569,7 +1569,7 @@ function extractSalePriceFromHistory(priceHistory) {
  * 5. Use extractSalePriceFromHistory to find real prices
  * 6. Score, rank, and return
  */
-async function findComps(address, daysBack, env) {
+async function findComps(address, daysBack, env, radiusMiles = 1.0) {
   // Step 1: Get subject property details
   let propertyData;
   try {
@@ -1685,7 +1685,7 @@ async function findComps(address, daysBack, env) {
   if (subject.latitude && subject.longitude) {
     try {
       // Search 0.75 mile radius — typically covers the subdivision without crossing arterials
-      redfinResults = await redfinSearchSold(subject.latitude, subject.longitude, 1.0, daysBack || 180);
+      redfinResults = await redfinSearchSold(subject.latitude, subject.longitude, radiusMiles, daysBack || 365);
       if (redfinResults.error) redfinError = redfinResults.error;
     } catch (e) {
       redfinError = e.message;
@@ -1859,18 +1859,39 @@ async function findComps(address, daysBack, env) {
     // Skip if price looks like a monthly rent
     if (price < 10000 && !soldDateStr) return;
 
-    // Skip active for-sale listings (we want sold/pending/recently sold comps)
-    const isActiveListing2 = compStatus.includes('for_sale') || compStatus.includes('coming_soon')
-      || compStatus.includes('new_listing');
-    if (isActiveListing2 && !soldDateStr) return;
+    // NOTE: We no longer skip for-sale listings here — they're kept as fallback comps
+    // when there aren't enough sold/pending comps. They get classified as 'for_sale'
+    // and hidden in the frontend if there are 3+ verified comps.
 
-    // ZESTIMATE DETECTION: Flag likely Zestimates but DON'T filter them out —
-    // in non-disclosure states (TX) these may be the only data available.
-    // Instead, label them and heavily penalize their match score.
+    // ZESTIMATE DETECTION
     const isLikelyZestimate = comp.zestimate && Math.abs(price - comp.zestimate) < 100 && !soldDateStr
       && (!priceSource || priceSource.startsWith('price:'));
     if (isLikelyZestimate) {
       priceSource = 'zestimate';
+    }
+
+    // === COMP TYPE CLASSIFICATION ===
+    // Classify each comp into one of: sold, pending, for_sale, zestimate
+    let compType = 'unknown';
+    if (priceSource === 'zestimate') {
+      compType = 'zestimate';
+    } else if (priceSource && (priceSource.includes('sold') || priceSource === 'soldPrice' || priceSource === 'lastSoldPrice' || priceSource === 'lastSalePrice' || priceSource.includes('pending_before_sold'))) {
+      compType = 'sold';
+    } else if (priceSource && (priceSource.includes('pending') && !priceSource.includes('pending_before_sold'))) {
+      compType = 'pending';
+    } else if (compStatus.includes('for_sale') || compStatus.includes('active') || compStatus.includes('coming_soon') || compStatus.includes('new_listing')) {
+      compType = 'for_sale';
+    } else if (soldDateStr) {
+      compType = 'sold'; // has a sold date, treat as sold even if source is ambiguous
+    } else if (priceSource && priceSource.startsWith('price:')) {
+      // Generic price with status hint — try to classify from status string in priceSource
+      const statusHint = priceSource.replace('price:', '').toLowerCase();
+      if (statusHint.includes('sold') || statusHint.includes('recently_sold')) compType = 'sold';
+      else if (statusHint.includes('pending') || statusHint.includes('contingent')) compType = 'pending';
+      else if (statusHint.includes('for_sale') || statusHint.includes('active')) compType = 'for_sale';
+      else compType = 'for_sale'; // default ambiguous to for_sale (not a verified transaction)
+    } else {
+      compType = 'for_sale'; // no sold date, no clear source — treat as listing
     }
 
     // Date filter — allow wider window for non-disclosure states
@@ -1883,26 +1904,34 @@ async function findComps(address, daysBack, env) {
     let distance = null;
     if (subject.latitude && subject.longitude && comp.latitude && comp.longitude) {
       distance = haversineDistance(subject.latitude, subject.longitude, comp.latitude, comp.longitude);
-      if (distance > 5) return;
+      if (distance > Math.max(radiusMiles * 2, 3)) return; // allow 2x the search radius as max distance
     }
 
     comp._distance = distance;
     const scoring = scoreComp(subject, comp);
 
-    // Adjust match score based on price source quality
+    // Adjust match score based on comp type quality
     let adjustedMatchPct = scoring.matchPct;
 
     // Heavy penalty for Zestimate-only prices (not real sale data)
-    if (priceSource === 'zestimate') {
+    if (compType === 'zestimate') {
       adjustedMatchPct = Math.max(0, adjustedMatchPct - 20);
     }
-    // Moderate penalty for generic price with unknown source
+    // Moderate penalty for for-sale listings (not transacted)
+    else if (compType === 'for_sale') {
+      adjustedMatchPct = Math.max(0, adjustedMatchPct - 15);
+    }
+    // Slight penalty for generic price with unknown source
     else if (priceSource && priceSource.startsWith('price:')) {
       adjustedMatchPct = Math.max(0, adjustedMatchPct - 10);
     }
-    // Boost for verified sale prices
-    if (priceSource && (priceSource.includes('sold') || priceSource.includes('pending_before_sold'))) {
+    // Boost for verified sold prices
+    if (compType === 'sold') {
       adjustedMatchPct = Math.min(100, adjustedMatchPct + 5);
+    }
+    // Small boost for pending (real transaction, just not closed)
+    else if (compType === 'pending') {
+      adjustedMatchPct = Math.min(100, adjustedMatchPct + 3);
     }
 
     scoredComps.push({
@@ -1926,26 +1955,34 @@ async function findComps(address, daysBack, env) {
       _realtorPropertyId: comp._realtorPropertyId || null,
       _dataSource: comp._source || (comp.zpid ? 'zillow' : 'unknown'),
       _priceSource: priceSource || 'unknown',
+      _compType: compType,
       matchPct: adjustedMatchPct,
       grade: adjustedMatchPct >= 85 ? 'A' : adjustedMatchPct >= 70 ? 'B' : adjustedMatchPct >= 55 ? 'C' : adjustedMatchPct >= 40 ? 'D' : 'F',
       scoreBreakdown: scoring,
     });
   });
 
-  // Sort by match percentage (best first), then by verified price source
+  // Sort by comp type priority (sold > pending > for_sale > zestimate), then by match %
+  const compTypePriority = { sold: 0, pending: 1, for_sale: 2, zestimate: 3, unknown: 4 };
   scoredComps.sort((a, b) => {
-    // First by match %
+    // First by comp type priority
+    const aPri = compTypePriority[a._compType] ?? 4;
+    const bPri = compTypePriority[b._compType] ?? 4;
+    if (aPri !== bPri) return aPri - bPri;
+    // Then by match %
     if (b.matchPct !== a.matchPct) return b.matchPct - a.matchPct;
-    // Tiebreak: prefer verified prices
-    const aVerified = a._priceSource && (a._priceSource.includes('sold') || a._priceSource.includes('pending'));
-    const bVerified = b._priceSource && (b._priceSource.includes('sold') || b._priceSource.includes('pending'));
-    if (aVerified && !bVerified) return -1;
-    if (bVerified && !aVerified) return 1;
     return 0;
   });
 
-  // Calculate ARV from top comps — prefer verified-price comps
-  const verifiedComps = scoredComps.filter(c => c._priceSource && (c._priceSource.includes('sold') || c._priceSource.includes('pending') || c._priceSource.includes('lastSoldPrice') || c._priceSource.includes('soldPrice')));
+  // Separate comps by type for the frontend
+  const soldComps = scoredComps.filter(c => c._compType === 'sold');
+  const pendingComps = scoredComps.filter(c => c._compType === 'pending');
+  const forSaleComps = scoredComps.filter(c => c._compType === 'for_sale');
+  const zestimateComps = scoredComps.filter(c => c._compType === 'zestimate');
+  const verifiedComps = [...soldComps, ...pendingComps];
+  const hasEnoughVerified = verifiedComps.length >= 3;
+
+  // Calculate ARV from top comps — ONLY use sold/pending comps for ARV
   const topComps = verifiedComps.length >= 3 ? verifiedComps.slice(0, 6) :
     scoredComps.filter(c => c.grade === 'A' || c.grade === 'B').slice(0, 6);
   const arvComps = topComps.length >= 3 ? topComps : scoredComps.slice(0, 6);
@@ -1962,6 +1999,11 @@ async function findComps(address, daysBack, env) {
     fullDataCount: fullDataProps.length,
     redfinCompsFound: redfinProps.length,
     realtorCompsFound: realtorCompsAdded,
+    soldCount: soldComps.length,
+    pendingCount: pendingComps.length,
+    forSaleCount: forSaleComps.length,
+    zestimateCount: zestimateComps.length,
+    hasEnoughVerified: hasEnoughVerified,
     daysBack: daysBack || 180,
     suggestedARV: avgARV,
     medianARV: medianARV,
@@ -2139,9 +2181,10 @@ export default {
         const address = url.searchParams.get('address');
         if (!address) return errorResponse('address parameter required');
         if (!env.ZILLOW_API_KEY) return errorResponse('ZILLOW_API_KEY not configured', 500);
-        const days = parseInt(url.searchParams.get('days')) || 180;
+        const days = parseInt(url.searchParams.get('days')) || 365;
+        const radius = parseFloat(url.searchParams.get('radius')) || 1.0;
         try {
-          const data = await findComps(address, days, env);
+          const data = await findComps(address, days, env, radius);
           if (data.error) return errorResponse(data.error, 400);
           return jsonResponse(data);
         } catch (compError) {
