@@ -799,7 +799,7 @@ async function realtorFindSoldComps(location, subjectLat, subjectLng, radiusMile
     const encoded = encodeURIComponent(location);
     const data = await realtorRequest(`/search/properties?location=${encoded}&status=sold&limit=42`, env);
 
-    const props = data?.home_search?.properties || data?.properties || [];
+    const props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
     const normalized = [];
 
     props.forEach(p => {
@@ -2425,14 +2425,14 @@ export default {
           if (propertyId) {
             // Fetch details for this property_id to get photos
             const data = await realtorGetPropertyDetails(propertyId, env);
-            const p = data?.home || data?.property || data || {};
+            const p = data?.data?.home || data?.data?.property || data?.home || data?.property || data?.data || data || {};
             photos = extractRealtorPhotos(p);
             debugInfo = { method: 'property_id', dataKeys: Object.keys(p).slice(0, 20), photosFieldType: typeof p.photos, photosIsArray: Array.isArray(p.photos), photosLength: Array.isArray(p.photos) ? p.photos.length : 0, primaryPhoto: p.primary_photo ? 'exists' : 'missing', samplePhoto: Array.isArray(p.photos) && p.photos[0] ? JSON.stringify(p.photos[0]).substring(0, 200) : 'none' };
             return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor', debug: debugInfo });
           } else if (address) {
             // Search by address location to find matching property
             const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(address)}&status=sold&limit=5`, env);
-            const props = data?.home_search?.properties || data?.properties || [];
+            const props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
             const normSearch = address.toLowerCase().replace(/[^a-z0-9]/g, '');
             let matched = props.find(p => {
               const addr = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -2444,7 +2444,7 @@ export default {
               if (photos.length <= 1 && matched.property_id) {
                 try {
                   const detailData = await realtorGetPropertyDetails(matched.property_id, env);
-                  const detailP = detailData?.home || detailData?.property || detailData || {};
+                  const detailP = detailData?.data?.home || detailData?.data?.property || detailData?.home || detailData?.property || detailData?.data || detailData || {};
                   const detailPhotos = extractRealtorPhotos(detailP);
                   if (detailPhotos.length > photos.length) photos = detailPhotos;
                 } catch(e2) {}
