@@ -723,6 +723,68 @@ async function realtorSearchSold(location, limit = 42) {
 }
 
 /**
+ * Extract photos from a Realtor.com property object, handling all known structures
+ */
+function extractRealtorPhotos(p) {
+  const photos = [];
+  const seen = new Set();
+  const addPhoto = (url) => {
+    if (url && typeof url === 'string' && url.startsWith('http') && !seen.has(url)) {
+      seen.add(url);
+      photos.push(url);
+    }
+  };
+
+  // primary_photo.href — always present in search results
+  if (p.primary_photo?.href) addPhoto(p.primary_photo.href);
+
+  // photos array — varies by endpoint
+  if (Array.isArray(p.photos)) {
+    p.photos.forEach(photo => {
+      if (typeof photo === 'string') addPhoto(photo);
+      else if (photo?.href) addPhoto(photo.href);
+      else if (photo?.url) addPhoto(photo.url);
+      // Nested tags structure: { tags: [{photos: [{href: "..."}]}] }
+      else if (photo?.tags && Array.isArray(photo.tags)) {
+        photo.tags.forEach(tag => {
+          if (tag?.photo?.href) addPhoto(tag.photo.href);
+          if (Array.isArray(tag?.photos)) {
+            tag.photos.forEach(tp => {
+              if (typeof tp === 'string') addPhoto(tp);
+              else if (tp?.href) addPhoto(tp.href);
+              else if (tp?.url) addPhoto(tp.url);
+            });
+          }
+        });
+      }
+    });
+  }
+
+  // photo array (singular — some responses use this)
+  if (Array.isArray(p.photo)) {
+    p.photo.forEach(photo => {
+      if (typeof photo === 'string') addPhoto(photo);
+      else if (photo?.href) addPhoto(photo.href);
+      else if (photo?.url) addPhoto(photo.url);
+    });
+  }
+
+  // media.photos
+  if (p.media?.photos && Array.isArray(p.media.photos)) {
+    p.media.photos.forEach(mp => {
+      if (typeof mp === 'string') addPhoto(mp);
+      else if (mp?.href) addPhoto(mp.href);
+      else if (mp?.url) addPhoto(mp.url);
+    });
+  }
+
+  // thumbnail
+  if (p.thumbnail) addPhoto(p.thumbnail);
+
+  return photos;
+}
+
+/**
  * Search Realtor.com sold properties and normalize results for comp pipeline
  */
 async function realtorFindSoldComps(location, subjectLat, subjectLng, radiusMiles, env) {
@@ -768,16 +830,8 @@ async function realtorFindSoldComps(location, subjectLat, subjectLng, radiusMile
       // Extract sold date
       const soldDate = p.sold_date || p.last_sold_date || p.date_sold || null;
 
-      // Extract photos
-      const photos = [];
-      if (Array.isArray(p.photos)) {
-        p.photos.forEach(photo => {
-          if (typeof photo === 'string') photos.push(photo);
-          else if (photo?.href) photos.push(photo.href);
-          else if (photo?.url) photos.push(photo.url);
-        });
-      }
-      if (p.primary_photo?.href) photos.unshift(p.primary_photo.href);
+      // Extract photos using shared helper
+      const photos = extractRealtorPhotos(p);
 
       normalized.push({
         streetAddress: fullAddress,
@@ -2367,37 +2421,37 @@ export default {
         if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
         try {
           let photos = [];
+          let debugInfo = {};
           if (propertyId) {
             // Fetch details for this property_id to get photos
             const data = await realtorGetPropertyDetails(propertyId, env);
             const p = data?.home || data?.property || data || {};
-            if (Array.isArray(p.photos)) {
-              p.photos.forEach(photo => {
-                if (typeof photo === 'string') photos.push(photo);
-                else if (photo?.href) photos.push(photo.href);
-                else if (photo?.url) photos.push(photo.url);
-              });
-            }
-            return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor' });
+            photos = extractRealtorPhotos(p);
+            debugInfo = { method: 'property_id', dataKeys: Object.keys(p).slice(0, 20), photosFieldType: typeof p.photos, photosIsArray: Array.isArray(p.photos), photosLength: Array.isArray(p.photos) ? p.photos.length : 0, primaryPhoto: p.primary_photo ? 'exists' : 'missing', samplePhoto: Array.isArray(p.photos) && p.photos[0] ? JSON.stringify(p.photos[0]).substring(0, 200) : 'none' };
+            return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor', debug: debugInfo });
           } else if (address) {
-            // Search by address location to find matching property + photos
+            // Search by address location to find matching property
             const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(address)}&status=sold&limit=5`, env);
             const props = data?.home_search?.properties || data?.properties || [];
-            // Try to find matching property
             const normSearch = address.toLowerCase().replace(/[^a-z0-9]/g, '');
             let matched = props.find(p => {
               const addr = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
               return addr && normSearch.includes(addr);
             }) || props[0];
-            if (matched && Array.isArray(matched.photos)) {
-              matched.photos.forEach(photo => {
-                if (typeof photo === 'string') photos.push(photo);
-                else if (photo?.href) photos.push(photo.href);
-                else if (photo?.url) photos.push(photo.url);
-              });
+            if (matched) {
+              photos = extractRealtorPhotos(matched);
+              // If search only gives primary_photo, try details endpoint for full gallery
+              if (photos.length <= 1 && matched.property_id) {
+                try {
+                  const detailData = await realtorGetPropertyDetails(matched.property_id, env);
+                  const detailP = detailData?.home || detailData?.property || detailData || {};
+                  const detailPhotos = extractRealtorPhotos(detailP);
+                  if (detailPhotos.length > photos.length) photos = detailPhotos;
+                } catch(e2) {}
+              }
             }
-            if (matched?.primary_photo?.href) photos.unshift(matched.primary_photo.href);
-            return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null });
+            debugInfo = { method: 'address', propsFound: props.length, matchedId: matched?.property_id || null };
+            return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null, debug: debugInfo });
           }
         } catch (e) {
           return jsonResponse({ photos: [], photoCount: 0, error: e.message, source: 'realtor' });
