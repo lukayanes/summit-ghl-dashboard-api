@@ -2431,19 +2431,13 @@ export default {
             return jsonResponse({ property_id: propertyId, photos, photoCount: photos.length, source: 'realtor', debug: debugInfo });
           } else if (address) {
             // Multi-strategy search to find a specific property on Realtor.com
-            // The API's /search/properties only returns a limited sample per location query,
-            // so we try multiple location queries to maximize our chance of finding the target.
             const addrParts = address.split(',').map(s => s.trim());
             const streetRaw = addrParts[0] ? addrParts[0].toLowerCase().trim() : '';
             const streetNorm = streetRaw.replace(/[^a-z0-9]/g, '');
             const streetNumMatch = streetRaw.match(/^(\d+)/);
             const streetNum = streetNumMatch ? streetNumMatch[1] : '';
-            // Extract key street name words (skip number and directional prefixes like N/S/E/W)
             const streetWords = streetRaw.replace(/^\d+\s*/, '').replace(/^[nsew]\s+/i, '').split(/\s+/).filter(w => w.length > 1);
-            // Extract the main street name (e.g., "masters" from "112 s masters dr")
-            const mainStreetName = streetWords.length > 0 ? streetWords[0] : '';
 
-            // Extract city, state, zip from the address
             let cityPart = '';
             let statePart = '';
             const zipMatch = address.match(/\b(\d{5})\b/);
@@ -2454,31 +2448,7 @@ export default {
               if (sm) statePart = sm[1];
             }
 
-            // Build location queries in priority order:
-            // 1. Full address as location (some APIs parse street-level)
-            // 2. Street name + city + state (narrow: "Masters Dr, Dallas, TX")
-            // 3. Zip code with high limit (covers the neighborhood)
-            // 4. City + state with high limit (widest net)
-            const trySearches = [];
-            // Strategy 1: full address as location
-            trySearches.push({ loc: address, limit: 20, label: 'full_address' });
-            // Strategy 2: street name + city/state
-            if (mainStreetName && cityPart) {
-              const streetNamePart = streetRaw.replace(/^\d+\s*/, '').trim(); // "s masters" or "s masters dr"
-              const streetLoc = streetNamePart + ', ' + cityPart + (statePart ? ', ' + statePart : '');
-              trySearches.push({ loc: streetLoc, limit: 50, label: 'street_city' });
-            }
-            // Strategy 3: zip code with high limit
-            if (searchZip) {
-              trySearches.push({ loc: searchZip, limit: 200, label: 'zip_200' });
-            }
-            // Strategy 4: city + state with high limit
-            if (cityPart && statePart) {
-              trySearches.push({ loc: cityPart + ', ' + statePart, limit: 200, label: 'city_state' });
-            }
-
             let matched = null;
-            let allProps = [];
             const triedDetails = [];
 
             // Fuzzy match function
@@ -2486,9 +2456,7 @@ export default {
               const line = (p.location?.address?.line || '').toLowerCase();
               const lineNorm = line.replace(/[^a-z0-9]/g, '');
               if (!line || !streetNorm) return false;
-              // Exact normalized match (handles suffix differences)
               if (lineNorm.includes(streetNorm) || streetNorm.includes(lineNorm)) return true;
-              // Fuzzy: same street number + at least one key street name word
               if (streetNum && line.startsWith(streetNum + ' ')) {
                 const nameMatch = streetWords.some(w => line.includes(w));
                 if (nameMatch) return true;
@@ -2496,27 +2464,90 @@ export default {
               return false;
             };
 
+            // === STRATEGY 0: Location Autocomplete ===
+            // The autocomplete endpoint can find specific addresses and return property-level results
+            try {
+              const acQuery = addrParts[0] + (cityPart ? ' ' + cityPart : '') + (statePart ? ' ' + statePart : '');
+              const acData = await realtorRequest(`/location/autocomplete?q=${encodeURIComponent(acQuery)}&limit=10`, env);
+              const acResults = acData?.data?.agents_location_search?.auto_complete
+                || acData?.agents_location_search?.auto_complete
+                || acData?.data?.autocomplete
+                || acData?.autocomplete
+                || (Array.isArray(acData?.data) ? acData.data : []);
+              triedDetails.push({ label: 'autocomplete', query: acQuery, found: acResults.length, sample: acResults.slice(0, 3).map(r => ({ type: r.area_type, line: r.line || r.full_address || r.city || '?', postal: r.postal_code })) });
+
+              // Look for an address-level result matching our street
+              const acMatch = acResults.find(r => {
+                const aType = (r.area_type || '').toLowerCase();
+                if (aType !== 'address' && aType !== 'postal_code' && aType !== '') return false;
+                const rLine = (r.line || r.full_address || '').toLowerCase();
+                if (!rLine) return false;
+                const rLineNorm = rLine.replace(/[^a-z0-9]/g, '');
+                if (rLineNorm.includes(streetNorm) || streetNorm.includes(rLineNorm)) return true;
+                if (streetNum && rLine.includes(streetNum)) {
+                  return streetWords.some(w => rLine.includes(w));
+                }
+                return false;
+              });
+
+              if (acMatch) {
+                triedDetails.push({ label: 'ac_match', match: acMatch });
+                // If autocomplete returned a property_id or mpr_id, use details endpoint
+                const acPropId = acMatch.property_id || acMatch.mpr_id || null;
+                if (acPropId) {
+                  try {
+                    const detailData = await realtorGetPropertyDetails(acPropId, env);
+                    const detailP = detailData?.data?.home || detailData?.data?.property || detailData?.home || detailData?.property || detailData?.data || detailData || {};
+                    photos = extractRealtorPhotos(detailP);
+                    debugInfo = { method: 'autocomplete_detail', property_id: acPropId, searches: triedDetails };
+                    return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: acPropId, debug: debugInfo });
+                  } catch (e3) { triedDetails.push({ label: 'ac_detail_error', error: e3.message }); }
+                }
+                // If it returned a postal_code we didn't have, add it to search list
+                if (acMatch.postal_code && acMatch.postal_code !== searchZip) {
+                  triedDetails.push({ label: 'ac_found_zip', zip: acMatch.postal_code });
+                }
+              }
+            } catch (acErr) {
+              triedDetails.push({ label: 'autocomplete_error', error: acErr.message });
+            }
+
+            // === STRATEGY 1-3: Property search with pagination ===
+            const trySearches = [];
+            if (searchZip) {
+              // Search zip with pagination: page 0, 1, 2 (up to 600 results)
+              trySearches.push({ loc: searchZip, limit: 200, offset: 0, label: 'zip_p0' });
+              trySearches.push({ loc: searchZip, limit: 200, offset: 200, label: 'zip_p1' });
+              trySearches.push({ loc: searchZip, limit: 200, offset: 400, label: 'zip_p2' });
+            }
+
+            let allProps = [];
             for (const search of trySearches) {
               if (matched) break;
               try {
-                const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(search.loc)}&status=sold&limit=${search.limit}`, env);
+                const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(search.loc)}&status=sold&limit=${search.limit}&offset=${search.offset}`, env);
                 const locProps = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
-                triedDetails.push({ label: search.label, loc: search.loc, found: locProps.length });
+                triedDetails.push({ label: search.label, found: locProps.length });
                 if (locProps.length > 0) {
                   allProps = allProps.concat(locProps);
                   matched = locProps.find(fuzzyMatch) || null;
                 }
+                // If this page returned fewer than limit, no more pages
+                if (locProps.length < search.limit) {
+                  // Skip remaining pages for this location
+                  const loc = search.loc;
+                  trySearches.forEach((s, i) => {
+                    if (i > trySearches.indexOf(search) && s.loc === loc) s._skip = true;
+                  });
+                }
               } catch (e) {
-                triedDetails.push({ label: search.label, loc: search.loc, error: e.message });
+                triedDetails.push({ label: search.label, error: e.message });
               }
+              if (search._skip) continue;
             }
-
-            // Deduplicate allProps for sample display
-            const totalSearched = allProps.length;
 
             if (matched) {
               photos = extractRealtorPhotos(matched);
-              // If search only gives primary_photo, try details endpoint for full gallery
               if (photos.length <= 1 && matched.property_id) {
                 try {
                   const detailData = await realtorGetPropertyDetails(matched.property_id, env);
@@ -2526,7 +2557,7 @@ export default {
                 } catch(e2) {}
               }
             }
-            debugInfo = { method: 'address', searches: triedDetails, totalSearched, streetNum, streetWords, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null, sampleAddrs: allProps.slice(0, 8).map(p => p.location?.address?.line || '?') };
+            debugInfo = { method: 'address', searches: triedDetails, totalSearched: allProps.length, streetNum, streetWords, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null, sampleAddrs: allProps.slice(0, 8).map(p => p.location?.address?.line || '?') };
             return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null, debug: debugInfo });
           }
         } catch (e) {
