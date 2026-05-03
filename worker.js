@@ -2441,29 +2441,32 @@ export default {
               // Maybe "Dallas, TX 75217"
               searchLocation = addrParts[1].trim();
             }
-            // Also try zip if present
+            // Also extract zip if present
             const zipMatch = address.match(/\b(\d{5})\b/);
             const searchZip = zipMatch ? zipMatch[1] : null;
 
-            // Try city+state first, fall back to zip
+            // Try zip FIRST (smaller area = better match), then city+state
             let props = [];
-            const tryLocations = [searchLocation];
-            if (searchZip && searchZip !== searchLocation) tryLocations.push(searchZip);
+            const tryLocations = [];
+            if (searchZip) tryLocations.push(searchZip);
+            if (searchLocation !== searchZip) tryLocations.push(searchLocation);
+
+            const streetPart = addrParts[0] ? addrParts[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+            let matched = null;
 
             for (const loc of tryLocations) {
-              if (props.length > 0) break;
+              if (matched) break;
               try {
-                const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(loc)}&status=sold&limit=20`, env);
-                props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
+                const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(loc)}&status=sold&limit=42`, env);
+                const locProps = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
+                if (locProps.length > props.length) props = locProps;
+                // Try to match by street address
+                matched = locProps.find(p => {
+                  const line = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+                  return line && streetPart && (line.includes(streetPart) || streetPart.includes(line));
+                }) || null;
               } catch (e) { /* try next location */ }
             }
-
-            // Match by street address in results
-            const streetPart = addrParts[0] ? addrParts[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '';
-            let matched = props.find(p => {
-              const line = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-              return line && streetPart && (line.includes(streetPart) || streetPart.includes(line));
-            }) || null;
             if (matched) {
               photos = extractRealtorPhotos(matched);
               // If search only gives primary_photo, try details endpoint for full gallery
@@ -2476,7 +2479,7 @@ export default {
                 } catch(e2) {}
               }
             }
-            debugInfo = { method: 'address', searchLocation: tryLocations[0], propsFound: props.length, streetPart, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null };
+            debugInfo = { method: 'address', triedLocations: tryLocations, propsFound: props.length, streetPart, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null };
             return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null, debug: debugInfo });
           }
         } catch (e) {
