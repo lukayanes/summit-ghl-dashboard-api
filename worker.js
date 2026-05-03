@@ -2519,7 +2519,7 @@ export default {
               try {
                 const body = {
                   query: {
-                    status: ['recently_sold', 'sold'],
+                    status: ['sold'],
                     street_name: streetRaw,
                     city: cityPart,
                     state_code: statePart,
@@ -2545,7 +2545,7 @@ export default {
               try {
                 const body = {
                   query: {
-                    status: ['recently_sold', 'sold'],
+                    status: ['sold'],
                     postal_code: searchZip,
                   },
                   limit: 42,
@@ -2572,7 +2572,7 @@ export default {
               try {
                 const body = {
                   query: {
-                    status: ['recently_sold', 'sold'],
+                    status: ['sold'],
                     address: streetRaw,
                     postal_code: searchZip || undefined,
                   },
