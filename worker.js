@@ -2451,7 +2451,13 @@ export default {
             if (searchZip) tryLocations.push(searchZip);
             if (searchLocation !== searchZip) tryLocations.push(searchLocation);
 
-            const streetPart = addrParts[0] ? addrParts[0].toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+            const streetRaw = addrParts[0] ? addrParts[0].toLowerCase().trim() : '';
+            const streetNorm = streetRaw.replace(/[^a-z0-9]/g, '');
+            // Extract just the street number for fuzzy matching
+            const streetNumMatch = streetRaw.match(/^(\d+)/);
+            const streetNum = streetNumMatch ? streetNumMatch[1] : '';
+            // Extract street name words (skip number and directional prefixes)
+            const streetWords = streetRaw.replace(/^\d+\s*/, '').replace(/^[nsew]\s+/i, '').split(/\s+/).filter(w => w.length > 1);
             let matched = null;
 
             for (const loc of tryLocations) {
@@ -2460,10 +2466,19 @@ export default {
                 const data = await realtorRequest(`/search/properties?location=${encodeURIComponent(loc)}&status=sold&limit=42`, env);
                 const locProps = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || [];
                 if (locProps.length > props.length) props = locProps;
-                // Try to match by street address
+                // Try to match by street address — multiple strategies
                 matched = locProps.find(p => {
-                  const line = (p.location?.address?.line || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                  return line && streetPart && (line.includes(streetPart) || streetPart.includes(line));
+                  const line = (p.location?.address?.line || '').toLowerCase();
+                  const lineNorm = line.replace(/[^a-z0-9]/g, '');
+                  if (!line || !streetNorm) return false;
+                  // Exact normalized match
+                  if (lineNorm.includes(streetNorm) || streetNorm.includes(lineNorm)) return true;
+                  // Fuzzy: same street number + at least one street name word matches
+                  if (streetNum && line.startsWith(streetNum + ' ')) {
+                    const nameMatch = streetWords.some(w => line.includes(w));
+                    if (nameMatch) return true;
+                  }
+                  return false;
                 }) || null;
               } catch (e) { /* try next location */ }
             }
@@ -2479,7 +2494,7 @@ export default {
                 } catch(e2) {}
               }
             }
-            debugInfo = { method: 'address', triedLocations: tryLocations, propsFound: props.length, streetPart, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null };
+            debugInfo = { method: 'address', triedLocations: tryLocations, propsFound: props.length, streetNum, streetWords, matchedId: matched?.property_id || null, matchedAddr: matched?.location?.address?.line || null, sampleAddrs: props.slice(0, 5).map(p => p.location?.address?.line || '?') };
             return jsonResponse({ address, photos, photoCount: photos.length, source: 'realtor', property_id: matched?.property_id || null, debug: debugInfo });
           }
         } catch (e) {
