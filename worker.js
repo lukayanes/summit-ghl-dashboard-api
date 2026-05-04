@@ -2486,10 +2486,24 @@ export default {
           };
 
           // Extract photos from new API response format
+          // Upscale rdcpix.com thumbnail URLs to full-size
+          // Pattern: ...abc123s.jpg → ...abc123od-w1024_h768.jpg (or just replace trailing 's' with 'od-w1024_h768')
+          const upscaleRealtorPhoto = (url) => {
+            if (!url || typeof url !== 'string') return url;
+            // rdcpix.com URLs end with a size suffix before .jpg/.jpeg/.png
+            // e.g., ...m1103306381s.jpg → ...m1103306381od-w1024_h768.jpg
+            return url.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
+          };
+
           const extractNewApiPhotos = (property) => {
             const pics = [];
             const seen = new Set();
-            const add = (u) => { if (u && typeof u === 'string' && u.startsWith('http') && !seen.has(u)) { seen.add(u); pics.push(u); } };
+            const add = (u) => {
+              if (u && typeof u === 'string' && u.startsWith('http')) {
+                const fullSize = upscaleRealtorPhoto(u);
+                if (!seen.has(fullSize)) { seen.add(fullSize); pics.push(fullSize); }
+              }
+            };
             // Direct photos array
             if (Array.isArray(property.photos)) {
               property.photos.forEach(ph => {
@@ -2595,6 +2609,23 @@ export default {
           // Build matched address info for link updates
           const matchedAddr = matchedProperty?.location?.address?.line || matchedProperty?.address?.line || null;
           const matchedPropId = matchedProperty?.property_id || matchedProperty?.listing_id || null;
+          const matchedCity = matchedProperty?.location?.address?.city || matchedProperty?.address?.city || cityPart || '';
+          const matchedState = matchedProperty?.location?.address?.state_code || matchedProperty?.address?.state_code || statePart || '';
+          const matchedZip = matchedProperty?.location?.address?.postal_code || matchedProperty?.address?.postal_code || searchZip || '';
+
+          // Build Realtor.com permalink
+          // Format: /realestateandhomes-detail/112-S-Masters-Dr_Dallas_TX_75217_M82923-87141
+          // property_id "8292387141" → "M82923-87141" (M + first 5 digits + hyphen + rest)
+          let realtorPermalink = null;
+          if (matchedAddr && matchedPropId) {
+            const streetSlug = matchedAddr.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-]/g, '');
+            const citySlug = matchedCity.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-]/g, '');
+            const pidStr = String(matchedPropId);
+            const mId = pidStr.length === 10 ? 'M' + pidStr.substring(0, 5) + '-' + pidStr.substring(5) : pidStr;
+            realtorPermalink = 'https://www.realtor.com/realestateandhomes-detail/' + streetSlug + '_' + citySlug + (matchedState ? '_' + matchedState : '') + (matchedZip ? '_' + matchedZip : '') + '_' + mId;
+          } else if (matchedProperty?.permalink) {
+            realtorPermalink = 'https://www.realtor.com/realestateandhomes-detail/' + matchedProperty.permalink;
+          }
 
           debugInfo = {
             method: 'realtor_data_api',
@@ -2613,6 +2644,7 @@ export default {
             photoCount: photos.length,
             source: 'realtor',
             property_id: matchedPropId,
+            permalink: realtorPermalink,
             debug: debugInfo,
           });
         } catch (e) {
