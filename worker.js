@@ -2606,48 +2606,8 @@ export default {
             }
           }
 
-          // Always try the detail endpoint for the full gallery (search only returns preview photos)
-          // Realtor.com may suppress photos for sold/off-market listings, but detail often has more
-          if (matchedProperty && matchedProperty.property_id) {
-            try {
-              const detailBody = { property_id: matchedProperty.property_id };
-              const detailData = await realtorDataRequest('/property_detail/', detailBody, env);
-              // The detail response can be nested differently — try multiple paths
-              const detailProp = detailData?.data?.home || detailData?.data || detailData?.home || detailData || {};
-              // Use the same comprehensive extractor that handles all photo formats
-              const detailPhotos = extractNewApiPhotos(detailProp);
-              // Also try a deeper nested path if photos array is at data.data.photos
-              if (detailPhotos.length === 0 && detailData?.data?.data?.photos) {
-                const deepProp = detailData.data.data;
-                const deepPhotos = extractNewApiPhotos(deepProp);
-                if (deepPhotos.length > 0) {
-                  detailPhotos.push(...deepPhotos);
-                }
-              }
-              const detailDebug = {
-                label: 'detail_endpoint',
-                found: detailPhotos.length,
-                responseKeys: Object.keys(detailProp).slice(0, 20),
-                hasPhotosArray: Array.isArray(detailProp.photos),
-                photosArrayLen: Array.isArray(detailProp.photos) ? detailProp.photos.length : 0,
-                topLevelKeys: Object.keys(detailData || {}).slice(0, 10),
-                dataKeys: detailData?.data ? Object.keys(detailData.data).slice(0, 10) : [],
-                photoCount: detailProp.photo_count || detailProp.photos_count || null,
-              };
-              if (detailPhotos.length > photos.length) {
-                photos = detailPhotos;
-                detailDebug.used = true;
-              } else {
-                detailDebug.note = 'not_better_than_' + photos.length;
-              }
-              triedStrategies.push(detailDebug);
-              // Also grab permalink from detail if available
-              if (detailProp.permalink && !matchedProperty.permalink) matchedProperty.permalink = detailProp.permalink;
-              if (detailProp.href && !matchedProperty.href) matchedProperty.href = detailProp.href;
-            } catch (detErr) {
-              triedStrategies.push({ label: 'detail_endpoint', error: detErr.message });
-            }
-          }
+          // Note: realtor-data1 API only has /property_list/ — no detail endpoint exists.
+          // The photos returned by search are all we get (typically 2-3 for sold properties).
 
           // Build matched address info for link updates
           const matchedAddr = matchedProperty?.location?.address?.line || matchedProperty?.address?.line || null;
@@ -2750,80 +2710,32 @@ export default {
         }
       }
 
-      // Realtor Data API: property detail debug — shows full response shape for photo debugging
+      // Realtor Data API: debug — dumps raw /property_list/ response for a given address
       if (pathname === '/api/realtor/detail-debug') {
-        const property_id = url.searchParams.get('property_id');
         const address = url.searchParams.get('address');
-        if (!property_id && !address) return errorResponse('property_id or address required');
+        if (!address) return errorResponse('address parameter required');
         if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
         try {
-          let pid = property_id;
-          let searchDebug = {};
-          // If address given, find the property_id first using same logic as /api/realtor/photos
-          if (!pid && address) {
-            const addrParts = address.split(',').map(s => s.trim());
-            const streetRaw = addrParts[0] || '';
-            const cityPart = addrParts[1] || '';
-            const stateZipPart = addrParts.length >= 3 ? addrParts.slice(2).join(' ').trim() : '';
-            const sm = stateZipPart.match(/([A-Z]{2})/);
-            const statePart = sm ? sm[1] : '';
-            const zipMatch = address.match(/\b(\d{5})\b/);
-            const searchZip = zipMatch ? zipMatch[1] : null;
-
-            // Strategy 1: street + city + state
-            if (streetRaw && cityPart && statePart) {
-              const body1 = { query: { status: ['sold'], street_name: streetRaw, city: cityPart, state_code: statePart }, limit: 20, offset: 0 };
-              const d1 = await realtorDataRequest('/property_list/', body1, env);
-              const p1 = d1?.data?.home_search?.properties || d1?.home_search?.properties || d1?.properties || d1?.data?.properties || [];
-              searchDebug.strategy1 = { body: body1, found: p1.length, firstAddr: p1[0]?.location?.address?.line || p1[0]?.address?.line || null, firstPid: p1[0]?.property_id || null };
-              if (p1.length > 0) pid = p1[0].property_id;
-            }
-            // Strategy 2: zip search
-            if (!pid && searchZip) {
-              const body2 = { query: { status: ['sold'], postal_code: searchZip }, limit: 42, offset: 0, sort: { direction: 'desc', field: 'sold_date' } };
-              const d2 = await realtorDataRequest('/property_list/', body2, env);
-              const p2 = d2?.data?.home_search?.properties || d2?.home_search?.properties || d2?.properties || d2?.data?.properties || [];
-              searchDebug.strategy2 = { found: p2.length };
-              // Fuzzy match
-              const streetNum = streetRaw.match(/^(\d+)/)?.[1] || '';
-              const streetWords = streetRaw.toLowerCase().replace(/^\d+\s*/, '').replace(/^[nsew]\s+/i, '').split(/\s+/).filter(w => w.length > 1);
-              for (const p of p2) {
-                const line = (p.location?.address?.line || p.address?.line || '').toLowerCase();
-                if (streetNum && line.startsWith(streetNum + ' ') && streetWords.some(w => line.includes(w))) {
-                  pid = p.property_id;
-                  searchDebug.strategy2.matchedAddr = line;
-                  break;
-                }
-              }
-            }
-            // Strategy 3: address field
-            if (!pid) {
-              const body3 = { query: { status: ['sold'], address: streetRaw, postal_code: searchZip || undefined }, limit: 10, offset: 0 };
-              const d3 = await realtorDataRequest('/property_list/', body3, env);
-              const p3 = d3?.data?.home_search?.properties || d3?.home_search?.properties || d3?.properties || d3?.data?.properties || [];
-              searchDebug.strategy3 = { found: p3.length, firstAddr: p3[0]?.location?.address?.line || p3[0]?.address?.line || null, firstPid: p3[0]?.property_id || null };
-              if (p3.length > 0) pid = p3[0].property_id;
-            }
-          }
-          if (!pid) return jsonResponse({ error: 'Could not find property_id', address, searchDebug });
-
-          // Now fetch the detail
-          const detailData = await realtorDataRequest('/property_detail/', { property_id: pid }, env);
-          // Analyze response shape thoroughly
-          const topKeys = Object.keys(detailData || {});
-          const dataKeys = detailData?.data ? Object.keys(detailData.data) : [];
-          const homeKeys = detailData?.data?.home ? Object.keys(detailData.data.home) : [];
-          const prop = detailData?.data?.home || detailData?.data || detailData || {};
-          const photoInfo = {
-            hasPhotosArray: Array.isArray(prop.photos),
-            photosLength: Array.isArray(prop.photos) ? prop.photos.length : 0,
-            photosSample: Array.isArray(prop.photos) ? prop.photos.slice(0, 3) : null,
-            primaryPhoto: prop.primary_photo || null,
-            thumbnail: prop.thumbnail || null,
-            photoCount: prop.photo_count || prop.photos_count || null,
-            suppressionFlags: prop.suppression_flags || null,
-          };
-          return jsonResponse({ property_id: pid, searchDebug, topKeys, dataKeys, homeKeys, propKeys: Object.keys(prop).slice(0, 30), photoInfo, permalink: prop.permalink || null, href: prop.href || null, rawSnippet: JSON.stringify(detailData).substring(0, 5000) });
+          const addrParts = address.split(',').map(s => s.trim());
+          const streetRaw = addrParts[0] || '';
+          const cityPart = addrParts[1] || '';
+          const stateZipPart = addrParts.length >= 3 ? addrParts.slice(2).join(' ').trim() : '';
+          const sm = stateZipPart.match(/([A-Z]{2})/);
+          const statePart = sm ? sm[1] : '';
+          const body = { query: { status: ['sold'], street_name: streetRaw, city: cityPart, state_code: statePart }, limit: 5, offset: 0 };
+          const data = await realtorDataRequest('/property_list/', body, env);
+          const props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || data?.data?.properties || [];
+          const summary = props.map(p => ({
+            property_id: p.property_id,
+            address: p.location?.address?.line || p.address?.line,
+            city: p.location?.address?.city || p.address?.city,
+            permalink: p.permalink || null,
+            href: p.href || null,
+            photoCount: Array.isArray(p.photos) ? p.photos.length : 0,
+            primaryPhoto: p.primary_photo?.href || p.thumbnail || null,
+            allKeys: Object.keys(p).slice(0, 25),
+          }));
+          return jsonResponse({ address, searchBody: body, totalFound: props.length, properties: summary, rawSnippet: JSON.stringify(data).substring(0, 4000) });
         } catch (e) {
           return jsonResponse({ error: e.message });
         }
