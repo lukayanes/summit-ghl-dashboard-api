@@ -2824,12 +2824,22 @@ export default {
           };
 
           // Helper: extract image URLs from a text blob (message body, attachment fields, etc.)
+          let _debugAllUrls = [], _debugRejectedUrls = [];
           const extractImageUrls = (text) => {
             if (!text) return [];
             // Match URLs - broad pattern
             const urlRegex = /https?:\/\/[^\s"'<>\])}]+/gi;
             const matches = text.match(urlRegex) || [];
-            return matches.filter(isImageUrl);
+            const accepted = [];
+            for (const u of matches) {
+              _debugAllUrls.push(u.substring(0, 150));
+              if (isImageUrl(u)) {
+                accepted.push(u);
+              } else {
+                _debugRejectedUrls.push(u.substring(0, 150));
+              }
+            }
+            return accepted;
           };
 
           // === MODE 1: Pull photos from GHL conversation history ===
@@ -2929,6 +2939,8 @@ export default {
                     break;
                   }
 
+                  let skippedOutbound = 0, skippedCall = 0, scannedInbound = 0;
+                  let urlsFound = [], urlsRejected = [];
                   for (const msg of messages) {
                     totalMessages++;
 
@@ -2936,8 +2948,9 @@ export default {
                     // Skip outbound (our replies), calls, voicemails, etc.
                     const dir = (msg.direction || '').toLowerCase();
                     const msgType = (msg.type || msg.messageType || '').toLowerCase();
-                    if (dir === 'outbound' || dir === 'outgoing') continue;
-                    if (msgType === 'call' || msgType === 'voicemail' || msgType === 'voice') continue;
+                    if (dir === 'outbound' || dir === 'outgoing') { skippedOutbound++; continue; }
+                    if (msgType === 'call' || msgType === 'voicemail' || msgType === 'voice') { skippedCall++; continue; }
+                    scannedInbound++;
 
                     // Scan string fields on inbound messages for image URLs
                     const scanStr = (str) => {
@@ -2999,6 +3012,11 @@ export default {
                 }
               }
               debug.totalMessages = totalMessages;
+              debug.skippedOutbound = skippedOutbound;
+              debug.skippedCall = skippedCall;
+              debug.scannedInbound = scannedInbound;
+              debug.allUrlsFound = _debugAllUrls.slice(0, 30);
+              debug.rejectedUrls = _debugRejectedUrls.slice(0, 30);
             } catch (ghlErr) {
               debug.ghlError = ghlErr.message;
             }
