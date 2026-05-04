@@ -2810,11 +2810,16 @@ export default {
           const isImageUrl = (u) => {
             if (!u || typeof u !== 'string') return false;
             const lower = u.toLowerCase();
-            // Match common image hosting + file extensions
-            if (lower.includes('storage.googleapis.com')) return true;
-            if (lower.includes('firebasestorage.googleapis.com')) return true;
-            if (lower.includes('msgsndr.com') && (lower.includes('/image') || lower.match(/\.(jpg|jpeg|png|gif|webp|heic)/))) return true;
+            // Exclude audio/video/call recordings
+            if (lower.match(/\.(mp3|mp4|wav|ogg|m4a|aac|webm|mov|avi|3gp|amr)(\?|$)/)) return false;
+            if (lower.includes('/recording') || lower.includes('/voicemail') || lower.includes('/audio')) return false;
+            // Match image file extensions
             if (lower.match(/\.(jpg|jpeg|png|gif|webp|heic|bmp|tiff)(\?|$)/)) return true;
+            // Google storage — only if it looks like an image (has image extension or 'image' in path)
+            if (lower.includes('storage.googleapis.com') && (lower.includes('image') || lower.match(/\.(jpg|jpeg|png|gif|webp|heic)/))) return true;
+            if (lower.includes('firebasestorage.googleapis.com') && (lower.includes('image') || lower.match(/\.(jpg|jpeg|png|gif|webp|heic)/))) return true;
+            // GHL media server
+            if (lower.includes('msgsndr.com') && (lower.includes('/image') || lower.match(/\.(jpg|jpeg|png|gif|webp|heic)/))) return true;
             return false;
           };
 
@@ -2927,8 +2932,14 @@ export default {
                   for (const msg of messages) {
                     totalMessages++;
 
-                    // Scan EVERY string field on the message for image URLs
-                    // This catches body, contentUri, attachments, meta, and any other field
+                    // FILTER: Only inbound messages (from seller TO us)
+                    // Skip outbound (our replies), calls, voicemails, etc.
+                    const dir = (msg.direction || '').toLowerCase();
+                    const msgType = (msg.type || msg.messageType || '').toLowerCase();
+                    if (dir === 'outbound' || dir === 'outgoing') continue;
+                    if (msgType === 'call' || msgType === 'voicemail' || msgType === 'voice') continue;
+
+                    // Scan string fields on inbound messages for image URLs
                     const scanStr = (str) => {
                       const urls = extractImageUrls(str);
                       urls.forEach(u => {
