@@ -2606,6 +2606,34 @@ export default {
             }
           }
 
+          // If we found a property but only got a few photos, try the detail endpoint for the full gallery
+          if (matchedProperty && photos.length < 5 && matchedProperty.property_id) {
+            try {
+              // Try realtor-data1's property detail endpoint
+              const detailBody = { property_id: matchedProperty.property_id };
+              const detailData = await realtorDataRequest('/property_detail/', detailBody, env);
+              const detailProp = detailData?.data || detailData || {};
+              const detailPhotos = [];
+              if (Array.isArray(detailProp.photos)) {
+                detailProp.photos.forEach(ph => {
+                  const url = ph?.href || ph?.url || (typeof ph === 'string' ? ph : null);
+                  if (url) detailPhotos.push(upscaleRealtorPhoto(url));
+                });
+              }
+              if (detailPhotos.length > photos.length) {
+                photos = detailPhotos;
+                triedStrategies.push({ label: 'detail_endpoint', found: detailPhotos.length });
+              } else {
+                triedStrategies.push({ label: 'detail_endpoint', found: detailPhotos.length, note: 'not_better' });
+              }
+              // Also grab permalink from detail if available
+              if (detailProp.permalink && !matchedProperty.permalink) matchedProperty.permalink = detailProp.permalink;
+              if (detailProp.href && !matchedProperty.href) matchedProperty.href = detailProp.href;
+            } catch (detErr) {
+              triedStrategies.push({ label: 'detail_endpoint', error: detErr.message });
+            }
+          }
+
           // Build matched address info for link updates
           const matchedAddr = matchedProperty?.location?.address?.line || matchedProperty?.address?.line || null;
           const matchedPropId = matchedProperty?.property_id || matchedProperty?.listing_id || null;
