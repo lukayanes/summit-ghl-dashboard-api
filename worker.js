@@ -2775,15 +2775,264 @@ export default {
 
       // ---- Seller Photo Storage (Cloudflare KV) ----
 
-      if (pathname === '/api/photos/upload' && request.method === 'POST') {
-        // Upload a seller photo — stores base64 image in KV
+      // ---- Seller Property Photos (KV-backed) ----
+      // Key format: "photos:{normalizedAddress}" → JSON array of photo objects
+      // Each photo: { url, timestamp, source, mimeType }
+
+      // Helper: normalize address for consistent KV keys
+      const normalizeAddress = (addr) => {
+        if (!addr) return '';
+        return addr.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim().replace(/ /g, '_');
+      };
+
+      // GHL Webhook: Ingest seller photos by scraping contact's full conversation
+      // GHL workflow (tag trigger) sends: { contactId, address, contactName? }
+      // OR can still accept direct photoUrls: { address, photoUrls: [...] }
+      if (pathname === '/api/photos/ingest' && request.method === 'POST') {
         if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
         try {
           const body = await request.json();
-          const { dealId, photoData } = body;
-          if (!dealId || !photoData) return errorResponse('dealId and photoData required');
-          // photoData is a base64 data URL
-          // Limit: 25MB per KV value, base64 images are typically 100KB-2MB
+          const { address, contactId, firstName, lastName, photoUrls } = body;
+          if (!address) return errorResponse('address is required');
+
+          const key = 'photos:' + normalizeAddress(address);
+          const existingRaw = await env.SELLER_PHOTOS.get(key);
+          const existing = existingRaw ? JSON.parse(existingRaw) : { address, photos: [], contactName: null, contactId: null };
+          const contactName = [firstName, lastName].filter(Boolean).join(' ') || null;
+          if (contactName) existing.contactName = contactName;
+          if (contactId) existing.contactId = contactId;
+
+          const existingUrls = new Set(existing.photos.map(p => p.url));
+          let added = 0;
+          let debug = {};
+
+          // Helper: check if a URL looks like an image
+          const isImageUrl = (u) => {
+            if (!u || typeof u !== 'string') return false;
+            const lower = u.toLowerCase();
+            // Match common image hosting + file extensions
+            if (lower.includes('storage.googleapis.com')) return true;
+            if (lower.includes('firebasestorage.googleapis.com')) return true;
+            if (lower.includes('msgsndr.com') && (lower.includes('/image') || lower.match(/\.(jpg|jpeg|png|gif|webp|heic)/))) return true;
+            if (lower.match(/\.(jpg|jpeg|png|gif|webp|heic|bmp|tiff)(\?|$)/)) return true;
+            return false;
+          };
+
+          // Helper: extract image URLs from a text blob (message body, attachment fields, etc.)
+          const extractImageUrls = (text) => {
+            if (!text) return [];
+            // Match URLs - broad pattern
+            const urlRegex = /https?:\/\/[^\s"'<>\])}]+/gi;
+            const matches = text.match(urlRegex) || [];
+            return matches.filter(isImageUrl);
+          };
+
+          // === MODE 1: Pull photos from GHL conversation history ===
+          if (contactId && env.GHL_API_KEY) {
+            try {
+              // Step 1: Find the conversation for this contact
+              const searchResp = await fetch(`${GHL_BASE_URL}/conversations/search?contactId=${contactId}`, {
+                headers: {
+                  'Authorization': `Bearer ${env.GHL_API_KEY}`,
+                  'Version': API_VERSION,
+                  'Content-Type': 'application/json',
+                },
+              });
+              const searchData = await searchResp.json();
+              const conversations = searchData.conversations || [];
+              debug.conversationsFound = conversations.length;
+
+              if (conversations.length === 0) {
+                debug.note = 'No conversations found for this contact';
+              }
+
+              // Step 2: For each conversation, pull all messages and scan for image URLs
+              let totalMessages = 0;
+              for (const conv of conversations) {
+                const convId = conv.id;
+                let lastMessageId = null;
+                let hasMore = true;
+                let pageCount = 0;
+
+                while (hasMore && pageCount < 20) { // Safety: max 20 pages (~400 messages)
+                  let msgUrl = `${GHL_BASE_URL}/conversations/${convId}/messages?limit=20&type=TYPE_SMS,TYPE_EMAIL,TYPE_WHATSAPP`;
+                  if (lastMessageId) msgUrl += `&lastMessageId=${lastMessageId}`;
+
+                  const msgResp = await fetch(msgUrl, {
+                    headers: {
+                      'Authorization': `Bearer ${env.GHL_API_KEY}`,
+                      'Version': API_VERSION,
+                      'Content-Type': 'application/json',
+                    },
+                  });
+                  const msgData = await msgResp.json();
+                  const messages = msgData.messages || msgData.data?.messages || [];
+
+                  if (messages.length === 0) {
+                    hasMore = false;
+                    break;
+                  }
+
+                  for (const msg of messages) {
+                    totalMessages++;
+
+                    // Check message body for image URLs
+                    const bodyUrls = extractImageUrls(msg.body || '');
+                    bodyUrls.forEach(u => {
+                      if (!existingUrls.has(u)) {
+                        existing.photos.push({
+                          url: u,
+                          timestamp: msg.dateAdded || new Date().toISOString(),
+                          source: 'ghl_conversation',
+                          messageId: msg.id,
+                        });
+                        existingUrls.add(u);
+                        added++;
+                      }
+                    });
+
+                    // Check attachments array
+                    const attachments = msg.attachments || [];
+                    for (const att of attachments) {
+                      const attUrl = att.url || att.href || att;
+                      if (typeof attUrl === 'string' && isImageUrl(attUrl) && !existingUrls.has(attUrl)) {
+                        existing.photos.push({
+                          url: attUrl,
+                          timestamp: msg.dateAdded || new Date().toISOString(),
+                          source: 'ghl_attachment',
+                          messageId: msg.id,
+                        });
+                        existingUrls.add(attUrl);
+                        added++;
+                      }
+                    }
+
+                    // Check media/contentUri (Sendblue/SMS MMS media)
+                    if (msg.contentUri && isImageUrl(msg.contentUri) && !existingUrls.has(msg.contentUri)) {
+                      existing.photos.push({
+                        url: msg.contentUri,
+                        timestamp: msg.dateAdded || new Date().toISOString(),
+                        source: 'ghl_media',
+                        messageId: msg.id,
+                      });
+                      existingUrls.add(msg.contentUri);
+                      added++;
+                    }
+
+                    // Check meta.images or meta.media (some providers nest here)
+                    if (msg.meta) {
+                      const metaImages = msg.meta.images || msg.meta.media || [];
+                      const metaArr = Array.isArray(metaImages) ? metaImages : [metaImages];
+                      for (const mi of metaArr) {
+                        const miUrl = typeof mi === 'string' ? mi : (mi?.url || mi?.href || '');
+                        if (miUrl && isImageUrl(miUrl) && !existingUrls.has(miUrl)) {
+                          existing.photos.push({
+                            url: miUrl,
+                            timestamp: msg.dateAdded || new Date().toISOString(),
+                            source: 'ghl_meta',
+                            messageId: msg.id,
+                          });
+                          existingUrls.add(miUrl);
+                          added++;
+                        }
+                      }
+                    }
+                  }
+
+                  // Pagination: use the last message ID
+                  lastMessageId = messages[messages.length - 1]?.id;
+                  hasMore = msgData.nextPage !== undefined ? !!msgData.nextPage : (messages.length >= 20);
+                  pageCount++;
+                }
+              }
+              debug.totalMessages = totalMessages;
+            } catch (ghlErr) {
+              debug.ghlError = ghlErr.message;
+            }
+          }
+
+          // === MODE 2: Direct photo URLs (fallback or manual use) ===
+          if (photoUrls && Array.isArray(photoUrls)) {
+            for (const photoUrl of photoUrls) {
+              if (photoUrl && typeof photoUrl === 'string' && photoUrl.startsWith('http') && !existingUrls.has(photoUrl)) {
+                existing.photos.push({
+                  url: photoUrl,
+                  timestamp: new Date().toISOString(),
+                  source: 'direct',
+                });
+                existingUrls.add(photoUrl);
+                added++;
+              }
+            }
+          }
+
+          // Sort photos by timestamp (oldest first)
+          existing.photos.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+          // Limit to 50 photos per property
+          if (existing.photos.length > 50) existing.photos = existing.photos.slice(-50);
+          await env.SELLER_PHOTOS.put(key, JSON.stringify(existing));
+
+          return jsonResponse({
+            success: true,
+            address,
+            contactId: contactId || null,
+            added,
+            totalPhotos: existing.photos.length,
+            key,
+            debug,
+          });
+        } catch(e) {
+          return errorResponse('Photo ingest failed: ' + e.message);
+        }
+      }
+
+      // Get all photos for a property by address
+      if (pathname === '/api/photos/by-address') {
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        const address = url.searchParams.get('address');
+        if (!address) return errorResponse('address parameter required');
+        const key = 'photos:' + normalizeAddress(address);
+        const raw = await env.SELLER_PHOTOS.get(key);
+        if (!raw) return jsonResponse({ address, photos: [], found: false });
+        const data = JSON.parse(raw);
+        return jsonResponse({ address, photos: data.photos || [], contactName: data.contactName, contactId: data.contactId, found: true });
+      }
+
+      // List all properties that have photos stored
+      if (pathname === '/api/photos/list-properties') {
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        const list = await env.SELLER_PHOTOS.list({ prefix: 'photos:' });
+        const properties = [];
+        for (const k of list.keys) {
+          const addr = k.name.replace('photos:', '').replace(/_/g, ' ');
+          properties.push({ key: k.name, address: addr });
+        }
+        return jsonResponse({ properties, count: properties.length });
+      }
+
+      // Upload a seller photo — stores base64 image in KV (legacy single-photo per dealId)
+      if (pathname === '/api/photos/upload' && request.method === 'POST') {
+        if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
+        try {
+          const body = await request.json();
+          const { dealId, photoData, address, photoUrl } = body;
+
+          // New format: upload by address with URL
+          if (address && photoUrl) {
+            const key = 'photos:' + normalizeAddress(address);
+            const existingRaw = await env.SELLER_PHOTOS.get(key);
+            const existing = existingRaw ? JSON.parse(existingRaw) : { address, photos: [] };
+            const existingUrls = new Set(existing.photos.map(p => p.url));
+            if (!existingUrls.has(photoUrl)) {
+              existing.photos.push({ url: photoUrl, timestamp: new Date().toISOString(), source: 'manual_upload' });
+            }
+            await env.SELLER_PHOTOS.put(key, JSON.stringify(existing));
+            return jsonResponse({ success: true, address, totalPhotos: existing.photos.length });
+          }
+
+          // Legacy format: single base64 per dealId
+          if (!dealId || !photoData) return errorResponse('dealId and photoData required (or address and photoUrl)');
           if (photoData.length > 5 * 1024 * 1024) return errorResponse('Photo too large (max 5MB)');
           await env.SELLER_PHOTOS.put('photo:' + dealId, photoData);
           return jsonResponse({ success: true, dealId: dealId });
@@ -2793,7 +3042,6 @@ export default {
       }
 
       if (pathname === '/api/photos/get') {
-        // Get a single photo by dealId
         if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
         const dealId = url.searchParams.get('dealId');
         if (!dealId) return errorResponse('dealId parameter required');
@@ -2802,7 +3050,6 @@ export default {
       }
 
       if (pathname === '/api/photos/list') {
-        // List all stored photos (returns dealIds only, not photo data)
         if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
         const list = await env.SELLER_PHOTOS.list({ prefix: 'photo:' });
         const dealIds = list.keys.map(k => k.name.replace('photo:', ''));
@@ -2810,7 +3057,6 @@ export default {
       }
 
       if (pathname === '/api/photos/batch') {
-        // Get multiple photos at once
         if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
         const ids = (url.searchParams.get('dealIds') || '').split(',').filter(Boolean);
         if (ids.length === 0) return errorResponse('dealIds parameter required (comma-separated)');
@@ -2826,9 +3072,18 @@ export default {
         if (!env.SELLER_PHOTOS) return errorResponse('SELLER_PHOTOS KV namespace not bound', 500);
         try {
           const body = await request.json();
-          if (!body.dealId) return errorResponse('dealId required');
-          await env.SELLER_PHOTOS.delete('photo:' + body.dealId);
-          return jsonResponse({ success: true, deleted: body.dealId });
+          const address = body.address;
+          const dealId = body.dealId;
+          if (address) {
+            const key = 'photos:' + normalizeAddress(address);
+            await env.SELLER_PHOTOS.delete(key);
+            return jsonResponse({ success: true, deleted: address });
+          }
+          if (dealId) {
+            await env.SELLER_PHOTOS.delete('photo:' + dealId);
+            return jsonResponse({ success: true, deleted: dealId });
+          }
+          return errorResponse('address or dealId required');
         } catch(e) {
           return errorResponse('Delete failed: ' + e.message);
         }
