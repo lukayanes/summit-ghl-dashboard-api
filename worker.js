@@ -2854,8 +2854,8 @@ export default {
                 let hasMore = true;
                 let pageCount = 0;
 
-                while (hasMore && pageCount < 20) { // Safety: max 20 pages (~400 messages)
-                  let msgUrl = `${GHL_BASE_URL}/conversations/${convId}/messages?limit=20&type=TYPE_SMS,TYPE_EMAIL,TYPE_WHATSAPP`;
+                while (hasMore && pageCount < 20) {
+                  let msgUrl = `${GHL_BASE_URL}/conversations/${convId}/messages?limit=20`;
                   if (lastMessageId) msgUrl += `&lastMessageId=${lastMessageId}`;
 
                   const msgResp = await fetch(msgUrl, {
@@ -2866,7 +2866,45 @@ export default {
                     },
                   });
                   const msgData = await msgResp.json();
-                  const messages = msgData.messages || msgData.data?.messages || [];
+
+                  // GHL API can return messages in various shapes — handle all of them
+                  let messages = [];
+                  if (Array.isArray(msgData.messages)) {
+                    messages = msgData.messages;
+                  } else if (Array.isArray(msgData)) {
+                    messages = msgData;
+                  } else if (msgData.messages && typeof msgData.messages === 'object') {
+                    // Might be an object keyed by ID — convert to array
+                    messages = Object.values(msgData.messages);
+                  } else if (msgData.data && Array.isArray(msgData.data.messages)) {
+                    messages = msgData.data.messages;
+                  } else if (msgData.data && Array.isArray(msgData.data)) {
+                    messages = msgData.data;
+                  }
+
+                  // On first page, capture the raw response shape for debugging
+                  if (pageCount === 0) {
+                    debug.msgResponseKeys = Object.keys(msgData || {});
+                    debug.msgResponseType = typeof msgData.messages;
+                    debug.msgIsArray = Array.isArray(msgData.messages);
+                    debug.messagesResolved = messages.length;
+                    if (messages.length > 0) {
+                      debug.sampleMsgKeys = Object.keys(messages[0]).slice(0, 20);
+                      // Show a sample message to understand the structure
+                      const sample = messages[0];
+                      debug.sampleMsg = {
+                        id: sample.id,
+                        type: sample.type,
+                        direction: sample.direction,
+                        bodySnippet: (sample.body || '').substring(0, 200),
+                        hasAttachments: !!(sample.attachments && (Array.isArray(sample.attachments) ? sample.attachments.length : true)),
+                        attachments: sample.attachments ? JSON.stringify(sample.attachments).substring(0, 300) : null,
+                        contentUri: sample.contentUri || null,
+                        mediaUrls: sample.mediaUrls || sample.media || null,
+                        metaKeys: sample.meta ? Object.keys(sample.meta).slice(0, 10) : null,
+                      };
+                    }
+                  }
 
                   if (messages.length === 0) {
                     hasMore = false;
@@ -2876,72 +2914,63 @@ export default {
                   for (const msg of messages) {
                     totalMessages++;
 
-                    // Check message body for image URLs
-                    const bodyUrls = extractImageUrls(msg.body || '');
-                    bodyUrls.forEach(u => {
-                      if (!existingUrls.has(u)) {
-                        existing.photos.push({
-                          url: u,
-                          timestamp: msg.dateAdded || new Date().toISOString(),
-                          source: 'ghl_conversation',
-                          messageId: msg.id,
-                        });
-                        existingUrls.add(u);
-                        added++;
-                      }
-                    });
-
-                    // Check attachments array
-                    const attachments = msg.attachments || [];
-                    for (const att of attachments) {
-                      const attUrl = att.url || att.href || att;
-                      if (typeof attUrl === 'string' && isImageUrl(attUrl) && !existingUrls.has(attUrl)) {
-                        existing.photos.push({
-                          url: attUrl,
-                          timestamp: msg.dateAdded || new Date().toISOString(),
-                          source: 'ghl_attachment',
-                          messageId: msg.id,
-                        });
-                        existingUrls.add(attUrl);
-                        added++;
-                      }
-                    }
-
-                    // Check media/contentUri (Sendblue/SMS MMS media)
-                    if (msg.contentUri && isImageUrl(msg.contentUri) && !existingUrls.has(msg.contentUri)) {
-                      existing.photos.push({
-                        url: msg.contentUri,
-                        timestamp: msg.dateAdded || new Date().toISOString(),
-                        source: 'ghl_media',
-                        messageId: msg.id,
-                      });
-                      existingUrls.add(msg.contentUri);
-                      added++;
-                    }
-
-                    // Check meta.images or meta.media (some providers nest here)
-                    if (msg.meta) {
-                      const metaImages = msg.meta.images || msg.meta.media || [];
-                      const metaArr = Array.isArray(metaImages) ? metaImages : [metaImages];
-                      for (const mi of metaArr) {
-                        const miUrl = typeof mi === 'string' ? mi : (mi?.url || mi?.href || '');
-                        if (miUrl && isImageUrl(miUrl) && !existingUrls.has(miUrl)) {
+                    // Scan EVERY string field on the message for image URLs
+                    // This catches body, contentUri, attachments, meta, and any other field
+                    const scanStr = (str) => {
+                      const urls = extractImageUrls(str);
+                      urls.forEach(u => {
+                        if (!existingUrls.has(u)) {
                           existing.photos.push({
-                            url: miUrl,
-                            timestamp: msg.dateAdded || new Date().toISOString(),
-                            source: 'ghl_meta',
+                            url: u,
+                            timestamp: msg.dateAdded || msg.createdAt || new Date().toISOString(),
+                            source: 'ghl_conversation',
                             messageId: msg.id,
                           });
-                          existingUrls.add(miUrl);
+                          existingUrls.add(u);
                           added++;
+                        }
+                      });
+                    };
+
+                    // Check body
+                    if (msg.body) scanStr(msg.body);
+
+                    // Check contentUri
+                    if (msg.contentUri) scanStr(msg.contentUri);
+
+                    // Check attachments — could be array of strings, array of objects, or a string
+                    if (msg.attachments) {
+                      if (typeof msg.attachments === 'string') {
+                        scanStr(msg.attachments);
+                      } else if (Array.isArray(msg.attachments)) {
+                        for (const att of msg.attachments) {
+                          if (typeof att === 'string') scanStr(att);
+                          else if (att && typeof att === 'object') {
+                            scanStr(att.url || att.href || att.uri || att.src || '');
+                          }
                         }
                       }
                     }
+
+                    // Check mediaUrls (Sendblue uses this)
+                    if (msg.mediaUrls) {
+                      if (Array.isArray(msg.mediaUrls)) msg.mediaUrls.forEach(u => scanStr(typeof u === 'string' ? u : (u?.url || '')));
+                      else if (typeof msg.mediaUrls === 'string') scanStr(msg.mediaUrls);
+                    }
+                    if (msg.media) {
+                      if (Array.isArray(msg.media)) msg.media.forEach(u => scanStr(typeof u === 'string' ? u : (u?.url || '')));
+                      else if (typeof msg.media === 'string') scanStr(msg.media);
+                    }
+
+                    // Check meta object recursively for any image URLs
+                    if (msg.meta && typeof msg.meta === 'object') {
+                      scanStr(JSON.stringify(msg.meta));
+                    }
                   }
 
-                  // Pagination: use the last message ID
+                  // Pagination
                   lastMessageId = messages[messages.length - 1]?.id;
-                  hasMore = msgData.nextPage !== undefined ? !!msgData.nextPage : (messages.length >= 20);
+                  hasMore = (msgData.nextPage !== undefined ? !!msgData.nextPage : (messages.length >= 20));
                   pageCount++;
                 }
               }
