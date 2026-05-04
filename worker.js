@@ -2867,15 +2867,28 @@ export default {
                   });
                   const msgData = await msgResp.json();
 
-                  // GHL API can return messages in various shapes — handle all of them
+                  // GHL API returns messages as an object of arrays:
+                  // { messages: { "key1": [msg, msg, ...], "key2": [msg, msg, ...] }, traceId: "..." }
+                  // Each value is an array of message objects — we need to flatten them all
                   let messages = [];
                   if (Array.isArray(msgData.messages)) {
                     messages = msgData.messages;
+                  } else if (msgData.messages && typeof msgData.messages === 'object') {
+                    // Object of arrays — flatten all values
+                    const vals = Object.values(msgData.messages);
+                    debug.msgObjectKeys = Object.keys(msgData.messages).slice(0, 10);
+                    debug.msgBatches = vals.length;
+                    debug.batchSizes = vals.map(v => Array.isArray(v) ? v.length : 1).slice(0, 10);
+                    for (const v of vals) {
+                      if (Array.isArray(v)) {
+                        messages.push(...v);
+                      } else if (v && typeof v === 'object' && v.id) {
+                        // Single message object
+                        messages.push(v);
+                      }
+                    }
                   } else if (Array.isArray(msgData)) {
                     messages = msgData;
-                  } else if (msgData.messages && typeof msgData.messages === 'object') {
-                    // Might be an object keyed by ID — convert to array
-                    messages = Object.values(msgData.messages);
                   } else if (msgData.data && Array.isArray(msgData.data.messages)) {
                     messages = msgData.data.messages;
                   } else if (msgData.data && Array.isArray(msgData.data)) {
