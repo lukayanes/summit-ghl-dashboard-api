@@ -2882,25 +2882,30 @@ export default {
                   });
                   const msgData = await msgResp.json();
 
-                  // GHL API returns messages as an object of arrays:
-                  // { messages: { "key1": [msg, msg, ...], "key2": [msg, msg, ...] }, traceId: "..." }
-                  // Each value is an array of message objects — we need to flatten them all
+                  // GHL API returns: { messages: { lastMessageId, nextPage, messages: [...] }, traceId }
+                  // The actual message array is nested at msgData.messages.messages
                   let messages = [];
                   if (Array.isArray(msgData.messages)) {
                     messages = msgData.messages;
                   } else if (msgData.messages && typeof msgData.messages === 'object') {
-                    // Object of arrays — flatten all values
-                    const vals = Object.values(msgData.messages);
-                    debug.msgObjectKeys = Object.keys(msgData.messages).slice(0, 10);
-                    debug.msgBatches = vals.length;
-                    debug.batchSizes = vals.map(v => Array.isArray(v) ? v.length : 1).slice(0, 10);
-                    for (const v of vals) {
-                      if (Array.isArray(v)) {
-                        messages.push(...v);
-                      } else if (v && typeof v === 'object' && v.id) {
-                        // Single message object
-                        messages.push(v);
+                    // Check for nested .messages array first (GHL's actual format)
+                    if (Array.isArray(msgData.messages.messages)) {
+                      messages = msgData.messages.messages;
+                      debug.msgStructure = 'msgData.messages.messages (array)';
+                      if (msgData.messages.nextPage) {
+                        debug.ghlNextPage = msgData.messages.nextPage;
                       }
+                    } else {
+                      // Fallback: flatten all array values
+                      const vals = Object.values(msgData.messages);
+                      for (const v of vals) {
+                        if (Array.isArray(v)) {
+                          messages.push(...v);
+                        } else if (v && typeof v === 'object' && v.id) {
+                          messages.push(v);
+                        }
+                      }
+                      debug.msgStructure = 'msgData.messages (flattened values)';
                     }
                   } else if (Array.isArray(msgData)) {
                     messages = msgData;
@@ -2946,8 +2951,8 @@ export default {
 
                     // FILTER: Only inbound messages (from seller TO us)
                     // Skip outbound (our replies), calls, voicemails, etc.
-                    const dir = (msg.direction || '').toLowerCase();
-                    const msgType = (msg.type || msg.messageType || '').toLowerCase();
+                    const dir = String(msg.direction || '').toLowerCase();
+                    const msgType = String(msg.messageType || msg.type || '').toLowerCase();
                     if (dir === 'outbound' || dir === 'outgoing') { skippedOutbound++; continue; }
                     if (msgType === 'call' || msgType === 'voicemail' || msgType === 'voice') { skippedCall++; continue; }
                     scannedInbound++;
@@ -3005,9 +3010,10 @@ export default {
                     }
                   }
 
-                  // Pagination
+                  // Pagination — nextPage can be at msgData.messages.nextPage or msgData.nextPage
                   lastMessageId = messages[messages.length - 1]?.id;
-                  hasMore = (msgData.nextPage !== undefined ? !!msgData.nextPage : (messages.length >= 20));
+                  const nextPage = (msgData.messages && msgData.messages.nextPage) || msgData.nextPage;
+                  hasMore = nextPage ? true : (messages.length >= 20);
                   pageCount++;
                 }
               }
