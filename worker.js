@@ -2758,15 +2758,56 @@ export default {
         if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
         try {
           let pid = property_id;
-          // If address given, find the property_id first
+          let searchDebug = {};
+          // If address given, find the property_id first using same logic as /api/realtor/photos
           if (!pid && address) {
             const addrParts = address.split(',').map(s => s.trim());
-            const body = { query: { status: ['sold'], street_name: addrParts[0] || address, city: addrParts[1] || '', state_code: (addrParts[2] || '').replace(/\d/g, '').trim() }, limit: 5, offset: 0 };
-            const searchData = await realtorDataRequest('/property_list/', body, env);
-            const props = searchData?.data?.home_search?.properties || searchData?.home_search?.properties || searchData?.properties || searchData?.data?.properties || [];
-            if (props.length > 0) pid = props[0].property_id;
+            const streetRaw = addrParts[0] || '';
+            const cityPart = addrParts[1] || '';
+            const stateZipPart = addrParts.length >= 3 ? addrParts.slice(2).join(' ').trim() : '';
+            const sm = stateZipPart.match(/([A-Z]{2})/);
+            const statePart = sm ? sm[1] : '';
+            const zipMatch = address.match(/\b(\d{5})\b/);
+            const searchZip = zipMatch ? zipMatch[1] : null;
+
+            // Strategy 1: street + city + state
+            if (streetRaw && cityPart && statePart) {
+              const body1 = { query: { status: ['sold'], street_name: streetRaw, city: cityPart, state_code: statePart }, limit: 20, offset: 0 };
+              const d1 = await realtorDataRequest('/property_list/', body1, env);
+              const p1 = d1?.data?.home_search?.properties || d1?.home_search?.properties || d1?.properties || d1?.data?.properties || [];
+              searchDebug.strategy1 = { body: body1, found: p1.length, firstAddr: p1[0]?.location?.address?.line || p1[0]?.address?.line || null, firstPid: p1[0]?.property_id || null };
+              if (p1.length > 0) pid = p1[0].property_id;
+            }
+            // Strategy 2: zip search
+            if (!pid && searchZip) {
+              const body2 = { query: { status: ['sold'], postal_code: searchZip }, limit: 42, offset: 0, sort: { direction: 'desc', field: 'sold_date' } };
+              const d2 = await realtorDataRequest('/property_list/', body2, env);
+              const p2 = d2?.data?.home_search?.properties || d2?.home_search?.properties || d2?.properties || d2?.data?.properties || [];
+              searchDebug.strategy2 = { found: p2.length };
+              // Fuzzy match
+              const streetNum = streetRaw.match(/^(\d+)/)?.[1] || '';
+              const streetWords = streetRaw.toLowerCase().replace(/^\d+\s*/, '').replace(/^[nsew]\s+/i, '').split(/\s+/).filter(w => w.length > 1);
+              for (const p of p2) {
+                const line = (p.location?.address?.line || p.address?.line || '').toLowerCase();
+                if (streetNum && line.startsWith(streetNum + ' ') && streetWords.some(w => line.includes(w))) {
+                  pid = p.property_id;
+                  searchDebug.strategy2.matchedAddr = line;
+                  break;
+                }
+              }
+            }
+            // Strategy 3: address field
+            if (!pid) {
+              const body3 = { query: { status: ['sold'], address: streetRaw, postal_code: searchZip || undefined }, limit: 10, offset: 0 };
+              const d3 = await realtorDataRequest('/property_list/', body3, env);
+              const p3 = d3?.data?.home_search?.properties || d3?.home_search?.properties || d3?.properties || d3?.data?.properties || [];
+              searchDebug.strategy3 = { found: p3.length, firstAddr: p3[0]?.location?.address?.line || p3[0]?.address?.line || null, firstPid: p3[0]?.property_id || null };
+              if (p3.length > 0) pid = p3[0].property_id;
+            }
           }
-          if (!pid) return jsonResponse({ error: 'Could not find property_id', address });
+          if (!pid) return jsonResponse({ error: 'Could not find property_id', address, searchDebug });
+
+          // Now fetch the detail
           const detailData = await realtorDataRequest('/property_detail/', { property_id: pid }, env);
           // Analyze response shape thoroughly
           const topKeys = Object.keys(detailData || {});
@@ -2782,7 +2823,7 @@ export default {
             photoCount: prop.photo_count || prop.photos_count || null,
             suppressionFlags: prop.suppression_flags || null,
           };
-          return jsonResponse({ property_id: pid, topKeys, dataKeys, homeKeys, propKeys: Object.keys(prop).slice(0, 30), photoInfo, permalink: prop.permalink || null, href: prop.href || null, rawSnippet: JSON.stringify(detailData).substring(0, 5000) });
+          return jsonResponse({ property_id: pid, searchDebug, topKeys, dataKeys, homeKeys, propKeys: Object.keys(prop).slice(0, 30), photoInfo, permalink: prop.permalink || null, href: prop.href || null, rawSnippet: JSON.stringify(detailData).substring(0, 5000) });
         } catch (e) {
           return jsonResponse({ error: e.message });
         }
