@@ -2606,26 +2606,41 @@ export default {
             }
           }
 
-          // If we found a property but only got a few photos, try the detail endpoint for the full gallery
-          if (matchedProperty && photos.length < 5 && matchedProperty.property_id) {
+          // Always try the detail endpoint for the full gallery (search only returns preview photos)
+          // Realtor.com may suppress photos for sold/off-market listings, but detail often has more
+          if (matchedProperty && matchedProperty.property_id) {
             try {
-              // Try realtor-data1's property detail endpoint
               const detailBody = { property_id: matchedProperty.property_id };
               const detailData = await realtorDataRequest('/property_detail/', detailBody, env);
-              const detailProp = detailData?.data || detailData || {};
-              const detailPhotos = [];
-              if (Array.isArray(detailProp.photos)) {
-                detailProp.photos.forEach(ph => {
-                  const url = ph?.href || ph?.url || (typeof ph === 'string' ? ph : null);
-                  if (url) detailPhotos.push(upscaleRealtorPhoto(url));
-                });
+              // The detail response can be nested differently — try multiple paths
+              const detailProp = detailData?.data?.home || detailData?.data || detailData?.home || detailData || {};
+              // Use the same comprehensive extractor that handles all photo formats
+              const detailPhotos = extractNewApiPhotos(detailProp);
+              // Also try a deeper nested path if photos array is at data.data.photos
+              if (detailPhotos.length === 0 && detailData?.data?.data?.photos) {
+                const deepProp = detailData.data.data;
+                const deepPhotos = extractNewApiPhotos(deepProp);
+                if (deepPhotos.length > 0) {
+                  detailPhotos.push(...deepPhotos);
+                }
               }
+              const detailDebug = {
+                label: 'detail_endpoint',
+                found: detailPhotos.length,
+                responseKeys: Object.keys(detailProp).slice(0, 20),
+                hasPhotosArray: Array.isArray(detailProp.photos),
+                photosArrayLen: Array.isArray(detailProp.photos) ? detailProp.photos.length : 0,
+                topLevelKeys: Object.keys(detailData || {}).slice(0, 10),
+                dataKeys: detailData?.data ? Object.keys(detailData.data).slice(0, 10) : [],
+                photoCount: detailProp.photo_count || detailProp.photos_count || null,
+              };
               if (detailPhotos.length > photos.length) {
                 photos = detailPhotos;
-                triedStrategies.push({ label: 'detail_endpoint', found: detailPhotos.length });
+                detailDebug.used = true;
               } else {
-                triedStrategies.push({ label: 'detail_endpoint', found: detailPhotos.length, note: 'not_better' });
+                detailDebug.note = 'not_better_than_' + photos.length;
               }
+              triedStrategies.push(detailDebug);
               // Also grab permalink from detail if available
               if (detailProp.permalink && !matchedProperty.permalink) matchedProperty.permalink = detailProp.permalink;
               if (detailProp.href && !matchedProperty.href) matchedProperty.href = detailProp.href;
@@ -2732,6 +2747,44 @@ export default {
           });
         } catch (e) {
           return jsonResponse({ error: e.message, endpoint });
+        }
+      }
+
+      // Realtor Data API: property detail debug — shows full response shape for photo debugging
+      if (pathname === '/api/realtor/detail-debug') {
+        const property_id = url.searchParams.get('property_id');
+        const address = url.searchParams.get('address');
+        if (!property_id && !address) return errorResponse('property_id or address required');
+        if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+        try {
+          let pid = property_id;
+          // If address given, find the property_id first
+          if (!pid && address) {
+            const addrParts = address.split(',').map(s => s.trim());
+            const body = { query: { status: ['sold'], street_name: addrParts[0] || address, city: addrParts[1] || '', state_code: (addrParts[2] || '').replace(/\d/g, '').trim() }, limit: 5, offset: 0 };
+            const searchData = await realtorDataRequest('/property_list/', body, env);
+            const props = searchData?.data?.home_search?.properties || searchData?.home_search?.properties || searchData?.properties || searchData?.data?.properties || [];
+            if (props.length > 0) pid = props[0].property_id;
+          }
+          if (!pid) return jsonResponse({ error: 'Could not find property_id', address });
+          const detailData = await realtorDataRequest('/property_detail/', { property_id: pid }, env);
+          // Analyze response shape thoroughly
+          const topKeys = Object.keys(detailData || {});
+          const dataKeys = detailData?.data ? Object.keys(detailData.data) : [];
+          const homeKeys = detailData?.data?.home ? Object.keys(detailData.data.home) : [];
+          const prop = detailData?.data?.home || detailData?.data || detailData || {};
+          const photoInfo = {
+            hasPhotosArray: Array.isArray(prop.photos),
+            photosLength: Array.isArray(prop.photos) ? prop.photos.length : 0,
+            photosSample: Array.isArray(prop.photos) ? prop.photos.slice(0, 3) : null,
+            primaryPhoto: prop.primary_photo || null,
+            thumbnail: prop.thumbnail || null,
+            photoCount: prop.photo_count || prop.photos_count || null,
+            suppressionFlags: prop.suppression_flags || null,
+          };
+          return jsonResponse({ property_id: pid, topKeys, dataKeys, homeKeys, propKeys: Object.keys(prop).slice(0, 30), photoInfo, permalink: prop.permalink || null, href: prop.href || null, rawSnippet: JSON.stringify(detailData).substring(0, 5000) });
+        } catch (e) {
+          return jsonResponse({ error: e.message });
         }
       }
 
