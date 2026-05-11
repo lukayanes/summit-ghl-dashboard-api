@@ -2530,15 +2530,45 @@ export default {
                 try {
                   const j = JSON.parse(body);
                   const before = photos.length;
+                  // Collect candidate URLs, then pick the highest-res variant per photo ID.
+                  // Redfin URLs look like: /photo/<N>/(bigphoto|islphoto|mbphoto|listphoto)/<PROPID>/genMid.<PHOTOID>_<IDX>.jpg
+                  //   bigphoto = full-res; islphoto/mbphoto = mid; listphoto = thumbnail
+                  //   genMid = full size; genHsr/genSmall/genTiny = tiny preview
+                  // We want: bigphoto + genMid (the actual gallery photo)
+                  const candidates = [];
                   const walk = (node) => {
                     if (!node) return;
                     if (typeof node === 'string') {
-                      if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\//.test(node)) add(node);
+                      if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\/.+\.(jpg|jpeg|png|webp)/i.test(node)) candidates.push(node);
                     } else if (Array.isArray(node)) node.forEach(walk);
                     else if (typeof node === 'object') Object.values(node).forEach(walk);
                   };
                   walk(j);
+                  // Rank: prefer bigphoto + genMid; reject genHsr/genSmall/genTiny entirely
+                  const ranked = candidates
+                    .filter(u => !/gen(Hsr|Small|Tiny|Thumb)/i.test(u))
+                    .map(u => {
+                      // Normalize to dedup key: photo ID + index (the bit before .jpg)
+                      const idMatch = u.match(/gen[A-Za-z]+\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
+                      const idKey = idMatch ? idMatch[1] : u;
+                      const isBig = /\/bigphoto\//i.test(u) ? 0 : (/\/islphoto\//i.test(u) ? 1 : (/\/mbphoto\//i.test(u) ? 2 : 3));
+                      return { url: u, idKey, rank: isBig };
+                    })
+                    .sort((a, b) => a.rank - b.rank);
+                  // Keep best variant per idKey
+                  const byId = {};
+                  ranked.forEach(r => { if (!byId[r.idKey]) byId[r.idKey] = r.url; });
+                  // Sort by photo index for natural display order
+                  const ordered = Object.entries(byId)
+                    .sort(([a], [b]) => {
+                      const ai = parseInt((a.split('_')[1] || '0'), 10);
+                      const bi = parseInt((b.split('_')[1] || '0'), 10);
+                      return ai - bi;
+                    })
+                    .map(([, u]) => u);
+                  ordered.forEach(add);
                   attempt.found = photos.length - before;
+                  attempt.candidates = candidates.length;
                 } catch (parseErr) {
                   attempt.parseError = parseErr.message;
                 }
@@ -2848,14 +2878,21 @@ export default {
               });
               scrapeDebug = { status: pageResp.status, contentLength: 0, found: 0 };
               if (pageResp.ok) {
-                const pageHtml = await pageResp.text();
+                let pageHtml = await pageResp.text();
                 scrapeDebug.contentLength = pageHtml.length;
 
-                // Pull all rdcpix.com photo URLs from the HTML (CDN that hosts Realtor photos)
+                // Decode unicode-escaped URLs that React SSR embeds in JSON state objects.
+                // Realtor embeds URLs as "https:\u002F\u002Fap.rdcpix.com\u002F..." inside JSON;
+                // our regex needs them as "https://ap.rdcpix.com/..." to match.
+                const decoded = pageHtml.replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/');
+
+                // Pull all rdcpix.com photo URLs (now from both raw and decoded forms)
                 const cdnRe = /https?:\/\/[a-z0-9.\-]*rdcpix\.com\/[^\s"'\\<>)]+\.(?:jpg|jpeg|png|webp)/gi;
-                const matches = pageHtml.match(cdnRe) || [];
+                const rawMatches = pageHtml.match(cdnRe) || [];
+                const decodedMatches = decoded.match(cdnRe) || [];
+                const allMatches = [...rawMatches, ...decodedMatches];
                 const newPhotos = [];
-                matches.forEach(u => {
+                allMatches.forEach(u => {
                   // Upscale thumb suffix to full-size: ...abc123s.jpg -> ...abc123od-w1024_h768.jpg
                   const upscaled = u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
                   const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
@@ -2865,7 +2902,7 @@ export default {
                   }
                 });
 
-                // Also pull og:image / twitter:image
+                // og:image / twitter:image meta tags
                 const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
                 let mm;
                 while ((mm = metaRe.exec(pageHtml)) !== null) {
@@ -2877,9 +2914,24 @@ export default {
                   }
                 }
 
-                // Append scraped photos to whatever the API gave us
+                // JSON state blob URLs in "photo_url"/"href" patterns (inline JSON for the gallery)
+                const jsonUrlRe = /"(?:photo_url|href|url|src|image|thumbnail)"\s*:\s*"([^"]*rdcpix\.com[^"]+?\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
+                let jm;
+                while ((jm = jsonUrlRe.exec(decoded)) !== null) {
+                  const u = jm[1].replace(/&amp;/g, '&').replace(/\\u002[fF]/g, '/');
+                  const upscaled = u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
+                  const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
+                  if (!seenPhotoUrls.has(dedupKey)) {
+                    seenPhotoUrls.add(dedupKey);
+                    newPhotos.push(upscaled);
+                  }
+                }
+
+                // Append scraped photos
                 if (newPhotos.length > 0) photos = photos.concat(newPhotos);
                 scrapeDebug.found = newPhotos.length;
+                scrapeDebug.rawMatches = rawMatches.length;
+                scrapeDebug.decodedMatches = decodedMatches.length;
               } else {
                 scrapeDebug.error = 'page returned ' + pageResp.status;
               }
