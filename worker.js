@@ -2425,7 +2425,7 @@ export default {
           return errorResponse('url must be a redfin.com URL');
         }
 
-        const cacheKey = 'redfin_photos_' + targetUrl;
+        const cacheKey = 'redfin_photos_v3_' + targetUrl;
         if (env.SELLER_PHOTOS) {
           const cached = await env.SELLER_PHOTOS.get(cacheKey);
           if (cached) {
@@ -2449,19 +2449,22 @@ export default {
 
         const rankAndDedup = (candidates) => {
           const filtered = candidates
+            // Must be a Redfin CDN photo URL
             .filter(u => /^https?:\/\/ssl\.cdn-redfin\.com\/photo\//i.test(u))
-            .filter(u => !/gen(Hsr|Small|Tiny|Thumb)/i.test(u))
+            // Reject ALL known thumbnail/preview generators — keep only genMid (gallery res)
+            .filter(u => /genMid\./i.test(u))
+            // Must have a valid photo index suffix like _0, _1, etc. (rejects template URLs)
+            .filter(u => /\.\d+_\d+\.(?:jpg|jpeg|png|webp)/i.test(u))
+            // Only full-res bigphoto path (skip islphoto/mbphoto/listphoto entirely)
+            .filter(u => /\/bigphoto\//i.test(u))
             .map(u => {
-              const idMatch = u.match(/gen[A-Za-z]+\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
-              return {
-                url: u.replace('/islphoto/', '/bigphoto/').replace('/mbphoto/', '/bigphoto/'),
-                idKey: idMatch ? idMatch[1] : u,
-                rank: /\/bigphoto\//i.test(u) ? 0 : (/\/islphoto\//i.test(u) ? 1 : (/\/mbphoto\//i.test(u) ? 2 : 3)),
-              };
-            })
-            .sort((a, b) => a.rank - b.rank);
+              const idMatch = u.match(/genMid\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
+              return { url: u, idKey: idMatch ? idMatch[1] : u };
+            });
+          // Dedup by photo identity
           const byId = {};
           filtered.forEach(r => { if (!byId[r.idKey]) byId[r.idKey] = r.url; });
+          // Sort by photo index for natural display order (front → kitchen → bedroom...)
           return Object.entries(byId)
             .sort(([a], [b]) => {
               const ai = parseInt((a.split('_')[1] || '0'), 10);
