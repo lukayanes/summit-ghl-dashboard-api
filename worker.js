@@ -2412,12 +2412,12 @@ export default {
         }
       }
 
-      // Redfin photo scraper — tries multiple strategies in order:
-      //  1) Redfin's internal stingray/api/home/details/aboveTheFold JSON (richest, no captcha)
-      //  2) Listing page HTML scrape with browser headers (og:image + JSON-LD + CDN regex)
-      //  3) Photo-specific URL variant (?widgetType=photos)
-      // Always returns a debug object so we can tell which strategy worked or why each failed.
-      // Cached in KV for 24h on success. Caller passes ?url=<comp.redfinUrl>.
+      // Redfin photo scraper — property-scoped to avoid mixing photos from nearby listings.
+      // Uses Redfin's /stingray/api/home/details/v1/photoUrls?propertyId=<id> endpoint which
+      // is per-property. Falls back to og:image only (single hero photo). We deliberately do
+      // NOT scrape arbitrary CDN URLs from the page because the listing HTML embeds nearby
+      // and "similar" property photos that would mix into the gallery.
+      // Cached in KV for 24h on success.
       if (pathname === '/api/redfin/photos') {
         const targetUrl = url.searchParams.get('url');
         if (!targetUrl) return errorResponse('url parameter required');
@@ -2436,211 +2436,118 @@ export default {
         const debug = { url: targetUrl, attempts: [] };
         const photos = [];
         const seen = new Set();
-        const add = (u) => {
-          if (!u || typeof u !== 'string') return;
-          let clean = u.replace(/&amp;/g, '&').trim();
-          if (!/^https?:\/\//i.test(clean)) return;
-          // Upscale low-res variants to full-size
-          clean = clean.replace('/islphoto/', '/bigphoto/').replace('/mbphoto/', '/bigphoto/');
-          if (seen.has(clean)) return;
-          seen.add(clean);
-          photos.push(clean);
-        };
 
-        // Extract Redfin property ID from URL — used by the internal API fallback.
-        // Patterns: /STATE/CITY/STREET-Home/123456789 or /STATE/CITY/STREET/home/123456789
         const idMatch = targetUrl.match(/(?:home\/|-Home\/)(\d{4,12})/i);
         const propertyId = idMatch ? idMatch[1] : null;
         debug.propertyId = propertyId;
 
-        // Browser-like headers used across all attempts
         const browserHeaders = {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'cross-site',
-          'Sec-Fetch-User': '?1',
-          'Upgrade-Insecure-Requests': '1',
           'Referer': 'https://www.google.com/',
         };
 
-        // Helper: extract photo URLs from a chunk of HTML using all known patterns
-        const harvestHtml = (html) => {
-          let count = 0;
-          // og:image / twitter:image meta tags
-          const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
-          let m;
-          while ((m = metaRe.exec(html)) !== null) { add(m[1]); count++; }
-
-          // Direct CDN URLs anywhere in HTML
-          const cdnRe = /https?:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'\\<>)]+\.(?:jpg|jpeg|png|webp)/gi;
-          const cdnMatches = html.match(cdnRe) || [];
-          cdnMatches.forEach(u => { add(u); count++; });
-
-          // JSON-LD structured data
-          const ldRe = /<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-          let ldMatch;
-          while ((ldMatch = ldRe.exec(html)) !== null) {
-            try {
-              const obj = JSON.parse(ldMatch[1].trim());
-              const drain = (node) => {
-                if (!node) return;
-                if (typeof node === 'string' && /^https?:\/\//.test(node) && /\.(jpg|jpeg|png|webp)/i.test(node)) { add(node); count++; }
-                else if (Array.isArray(node)) node.forEach(drain);
-                else if (typeof node === 'object') {
-                  if (node.image) drain(node.image);
-                  if (node.url && /\.(jpg|jpeg|png|webp)/i.test(node.url)) drain(node.url);
-                  if (node.contentUrl) drain(node.contentUrl);
-                }
+        const rankAndDedup = (candidates) => {
+          const filtered = candidates
+            .filter(u => /^https?:\/\/ssl\.cdn-redfin\.com\/photo\//i.test(u))
+            .filter(u => !/gen(Hsr|Small|Tiny|Thumb)/i.test(u))
+            .map(u => {
+              const idMatch = u.match(/gen[A-Za-z]+\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
+              return {
+                url: u.replace('/islphoto/', '/bigphoto/').replace('/mbphoto/', '/bigphoto/'),
+                idKey: idMatch ? idMatch[1] : u,
+                rank: /\/bigphoto\//i.test(u) ? 0 : (/\/islphoto\//i.test(u) ? 1 : (/\/mbphoto\//i.test(u) ? 2 : 3)),
               };
-              drain(obj);
-            } catch (_) {}
-          }
-          return count;
+            })
+            .sort((a, b) => a.rank - b.rank);
+          const byId = {};
+          filtered.forEach(r => { if (!byId[r.idKey]) byId[r.idKey] = r.url; });
+          return Object.entries(byId)
+            .sort(([a], [b]) => {
+              const ai = parseInt((a.split('_')[1] || '0'), 10);
+              const bi = parseInt((b.split('_')[1] || '0'), 10);
+              return ai - bi;
+            })
+            .map(([, u]) => u);
         };
 
-        // === STRATEGY 1: Redfin's internal photos API (stingray) ===
-        // Pulls every photo with captions from Redfin's own JSON. No captcha when called
-        // with the right Referer/User-Agent. Requires a property ID extracted from the URL.
+        // === STRATEGY 1: Property-scoped /photoUrls API ===
         if (propertyId) {
-          const apiUrls = [
-            'https://www.redfin.com/stingray/api/home/details/v1/photoUrls?propertyId=' + propertyId,
-            'https://www.redfin.com/stingray/api/home/details/aboveTheFold?accessLevel=1&propertyId=' + propertyId,
-          ];
-          for (const apiUrl of apiUrls) {
-            try {
-              const r = await fetch(apiUrl, {
-                headers: {
-                  ...browserHeaders,
-                  'Accept': 'application/json, text/plain, */*',
-                  'Referer': targetUrl,
-                  'X-Requested-With': 'XMLHttpRequest',
-                },
-              });
-              const attempt = { strategy: 'stingray', url: apiUrl, status: r.status, found: 0 };
-              if (r.ok) {
-                let body = await r.text();
-                // Redfin's JSON responses are prefixed with "{}&&" to prevent JSONP hijacking
-                body = body.replace(/^\{\}&&/, '').trim();
-                attempt.contentLength = body.length;
-                try {
-                  const j = JSON.parse(body);
-                  const before = photos.length;
-                  // Collect candidate URLs, then pick the highest-res variant per photo ID.
-                  // Redfin URLs look like: /photo/<N>/(bigphoto|islphoto|mbphoto|listphoto)/<PROPID>/genMid.<PHOTOID>_<IDX>.jpg
-                  //   bigphoto = full-res; islphoto/mbphoto = mid; listphoto = thumbnail
-                  //   genMid = full size; genHsr/genSmall/genTiny = tiny preview
-                  // We want: bigphoto + genMid (the actual gallery photo)
-                  const candidates = [];
-                  const walk = (node) => {
-                    if (!node) return;
-                    if (typeof node === 'string') {
-                      if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\/.+\.(jpg|jpeg|png|webp)/i.test(node)) candidates.push(node);
-                    } else if (Array.isArray(node)) node.forEach(walk);
-                    else if (typeof node === 'object') Object.values(node).forEach(walk);
-                  };
-                  walk(j);
-                  // Rank: prefer bigphoto + genMid; reject genHsr/genSmall/genTiny entirely
-                  const ranked = candidates
-                    .filter(u => !/gen(Hsr|Small|Tiny|Thumb)/i.test(u))
-                    .map(u => {
-                      // Normalize to dedup key: photo ID + index (the bit before .jpg)
-                      const idMatch = u.match(/gen[A-Za-z]+\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
-                      const idKey = idMatch ? idMatch[1] : u;
-                      const isBig = /\/bigphoto\//i.test(u) ? 0 : (/\/islphoto\//i.test(u) ? 1 : (/\/mbphoto\//i.test(u) ? 2 : 3));
-                      return { url: u, idKey, rank: isBig };
-                    })
-                    .sort((a, b) => a.rank - b.rank);
-                  // Keep best variant per idKey
-                  const byId = {};
-                  ranked.forEach(r => { if (!byId[r.idKey]) byId[r.idKey] = r.url; });
-                  // Sort by photo index for natural display order
-                  const ordered = Object.entries(byId)
-                    .sort(([a], [b]) => {
-                      const ai = parseInt((a.split('_')[1] || '0'), 10);
-                      const bi = parseInt((b.split('_')[1] || '0'), 10);
-                      return ai - bi;
-                    })
-                    .map(([, u]) => u);
-                  ordered.forEach(add);
-                  attempt.found = photos.length - before;
-                  attempt.candidates = candidates.length;
-                } catch (parseErr) {
-                  attempt.parseError = parseErr.message;
-                }
+          try {
+            const apiUrl = 'https://www.redfin.com/stingray/api/home/details/v1/photoUrls?propertyId=' + propertyId;
+            const r = await fetch(apiUrl, {
+              headers: {
+                ...browserHeaders,
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': targetUrl,
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+            });
+            const attempt = { strategy: 'photoUrls', status: r.status, found: 0 };
+            if (r.ok) {
+              let body = await r.text();
+              body = body.replace(/^\{\}&&/, '').trim();
+              attempt.contentLength = body.length;
+              try {
+                const j = JSON.parse(body);
+                const candidates = [];
+                const walk = (node) => {
+                  if (!node) return;
+                  if (typeof node === 'string') {
+                    if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\//.test(node)) candidates.push(node);
+                  } else if (Array.isArray(node)) node.forEach(walk);
+                  else if (typeof node === 'object') Object.values(node).forEach(walk);
+                };
+                walk(j);
+                const ordered = rankAndDedup(candidates);
+                ordered.forEach(u => { if (!seen.has(u)) { seen.add(u); photos.push(u); } });
+                attempt.found = photos.length;
+                attempt.candidates = candidates.length;
+              } catch (parseErr) {
+                attempt.parseError = parseErr.message;
               }
-              debug.attempts.push(attempt);
-              if (photos.length >= 5) break; // good enough, skip remaining strategies
-            } catch (e) {
-              debug.attempts.push({ strategy: 'stingray', url: apiUrl, error: e.message });
             }
+            debug.attempts.push(attempt);
+          } catch (e) {
+            debug.attempts.push({ strategy: 'photoUrls', error: e.message });
           }
         }
 
-        // === STRATEGY 2: Scrape the listing page HTML ===
-        if (photos.length < 5) {
+        // === STRATEGY 2: og:image only fallback (single hero photo, property-scoped) ===
+        if (photos.length === 0) {
           try {
             const r = await fetch(targetUrl, { headers: browserHeaders });
-            const attempt = { strategy: 'listing-page', status: r.status, found: 0 };
+            const attempt = { strategy: 'og-image', status: r.status, found: 0 };
             if (r.ok) {
               const html = await r.text();
               attempt.contentLength = html.length;
-              // Detect block/captcha pages (short body, captcha keywords, or "challenge" page)
-              if (html.length < 800 || /access[\s-]?denied|cf-error|distil_|px-captcha|forbidden/i.test(html.substring(0, 2000))) {
-                attempt.error = 'blocked/captcha page (len=' + html.length + ')';
+              if (html.length > 800 && !/access[\s-]?denied|cf-error|distil_|px-captcha/i.test(html.substring(0, 2000))) {
+                const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
+                let m;
+                while ((m = metaRe.exec(html)) !== null) {
+                  const u = m[1].replace(/&amp;/g, '&');
+                  if (!seen.has(u) && /^https?:\/\/ssl\.cdn-redfin\.com/.test(u)) {
+                    seen.add(u);
+                    photos.push(u);
+                  }
+                }
+                attempt.found = photos.length;
               } else {
-                const before = photos.length;
-                harvestHtml(html);
-                attempt.found = photos.length - before;
+                attempt.error = 'blocked/captcha page (len=' + html.length + ')';
               }
             } else {
               attempt.error = 'http ' + r.status;
             }
             debug.attempts.push(attempt);
           } catch (e) {
-            debug.attempts.push({ strategy: 'listing-page', error: e.message });
+            debug.attempts.push({ strategy: 'og-image', error: e.message });
           }
         }
 
-        // === STRATEGY 3: Photo widget variant URL ===
-        // Some Redfin pages expose a deeper gallery view at the same URL + ?widgetType=photos
-        if (photos.length < 5) {
-          try {
-            const widgetUrl = targetUrl + (targetUrl.includes('?') ? '&' : '?') + 'widgetType=photos';
-            const r = await fetch(widgetUrl, { headers: browserHeaders });
-            const attempt = { strategy: 'widget-page', status: r.status, found: 0 };
-            if (r.ok) {
-              const html = await r.text();
-              attempt.contentLength = html.length;
-              const before = photos.length;
-              harvestHtml(html);
-              attempt.found = photos.length - before;
-            } else {
-              attempt.error = 'http ' + r.status;
-            }
-            debug.attempts.push(attempt);
-          } catch (e) {
-            debug.attempts.push({ strategy: 'widget-page', error: e.message });
-          }
-        }
-
-        const result = {
-          url: targetUrl,
-          photos,
-          photoCount: photos.length,
-          source: 'redfin',
-          debug,
-        };
-
-        // Cache for 24h on success
+        const result = { url: targetUrl, photos, photoCount: photos.length, source: 'redfin', debug };
         if (env.SELLER_PHOTOS && photos.length > 0) {
           await env.SELLER_PHOTOS.put(cacheKey, JSON.stringify(result), { expirationTtl: 86400 });
         }
-
         return jsonResponse(result);
       }
 
@@ -2881,29 +2788,79 @@ export default {
                 let pageHtml = await pageResp.text();
                 scrapeDebug.contentLength = pageHtml.length;
 
-                // Decode unicode-escaped URLs that React SSR embeds in JSON state objects.
-                // Realtor embeds URLs as "https:\u002F\u002Fap.rdcpix.com\u002F..." inside JSON;
-                // our regex needs them as "https://ap.rdcpix.com/..." to match.
-                const decoded = pageHtml.replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/');
-
-                // Pull all rdcpix.com photo URLs (now from both raw and decoded forms)
-                const cdnRe = /https?:\/\/[a-z0-9.\-]*rdcpix\.com\/[^\s"'\\<>)]+\.(?:jpg|jpeg|png|webp)/gi;
-                const rawMatches = pageHtml.match(cdnRe) || [];
-                const decodedMatches = decoded.match(cdnRe) || [];
-                const allMatches = [...rawMatches, ...decodedMatches];
+                // Realtor.com is a Next.js app. Page state lives in:
+                //   <script id="__NEXT_DATA__" type="application/json">{...}</script>
+                // The TARGET property's photos sit at a scoped path inside that JSON, while
+                // "nearby"/"similar" properties live under different keys. We extract photos
+                // by walking ONLY the property's own subtree to avoid mixing in neighbors.
+                const nextDataRe = /<script[^>]+id\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i;
+                const nextMatch = pageHtml.match(nextDataRe);
                 const newPhotos = [];
-                allMatches.forEach(u => {
-                  // Upscale thumb suffix to full-size: ...abc123s.jpg -> ...abc123od-w1024_h768.jpg
-                  const upscaled = u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
-                  const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
-                  if (!seenPhotoUrls.has(dedupKey)) {
-                    seenPhotoUrls.add(dedupKey);
-                    newPhotos.push(upscaled);
-                  }
-                });
+                let nextDataFound = false;
+                let propertyNodeFound = false;
+                if (nextMatch) {
+                  nextDataFound = true;
+                  try {
+                    const state = JSON.parse(nextMatch[1]);
+                    const targetId = matchedPropId ? String(matchedPropId) : null;
+                    let propertyNode = null;
+                    const findProperty = (node, depth) => {
+                      if (!node || depth > 8 || propertyNode) return;
+                      if (Array.isArray(node)) { node.forEach(n => findProperty(n, depth + 1)); return; }
+                      if (typeof node === 'object') {
+                        const pid = node.property_id || node.propertyId || node.id;
+                        if (targetId && pid && String(pid) === targetId && (node.photos || node.photo)) {
+                          propertyNode = node;
+                          return;
+                        }
+                        if (!targetId && Array.isArray(node.photos) && node.photos.length >= 3) {
+                          propertyNode = node;
+                          return;
+                        }
+                        Object.values(node).forEach(v => findProperty(v, depth + 1));
+                      }
+                    };
+                    const candidatePaths = [
+                      ['props', 'pageProps', 'property'],
+                      ['props', 'pageProps', 'initialReduxState', 'propertyDetails', 'data', 'home'],
+                      ['props', 'pageProps', 'apolloState'],
+                      ['props', 'pageProps'],
+                    ];
+                    candidatePaths.forEach(path => {
+                      if (propertyNode) return;
+                      let cursor = state;
+                      for (const seg of path) {
+                        if (cursor && typeof cursor === 'object' && seg in cursor) cursor = cursor[seg];
+                        else { cursor = null; break; }
+                      }
+                      if (cursor) findProperty(cursor, 0);
+                    });
+                    if (!propertyNode) findProperty(state, 0);
 
-                // og:image / twitter:image meta tags
-                const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
+                    if (propertyNode) {
+                      propertyNodeFound = true;
+                      const photoArr = propertyNode.photos || propertyNode.photo || [];
+                      const upscale = (u) => u && u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
+                      (Array.isArray(photoArr) ? photoArr : [photoArr]).forEach(ph => {
+                        let u = null;
+                        if (typeof ph === 'string') u = ph;
+                        else if (ph && typeof ph === 'object') u = ph.href || ph.url || ph.src;
+                        if (!u || !/^https?:\/\//i.test(u)) return;
+                        const upscaled = upscale(u);
+                        const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
+                        if (!seenPhotoUrls.has(dedupKey)) {
+                          seenPhotoUrls.add(dedupKey);
+                          newPhotos.push(upscaled);
+                        }
+                      });
+                    }
+                  } catch (parseErr) {
+                    scrapeDebug.parseError = parseErr.message;
+                  }
+                }
+
+                // og:image is always safe (single hero photo from this property's metadata)
+                const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
                 let mm;
                 while ((mm = metaRe.exec(pageHtml)) !== null) {
                   const u = mm[1].replace(/&amp;/g, '&');
@@ -2914,24 +2871,10 @@ export default {
                   }
                 }
 
-                // JSON state blob URLs in "photo_url"/"href" patterns (inline JSON for the gallery)
-                const jsonUrlRe = /"(?:photo_url|href|url|src|image|thumbnail)"\s*:\s*"([^"]*rdcpix\.com[^"]+?\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
-                let jm;
-                while ((jm = jsonUrlRe.exec(decoded)) !== null) {
-                  const u = jm[1].replace(/&amp;/g, '&').replace(/\\u002[fF]/g, '/');
-                  const upscaled = u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
-                  const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
-                  if (!seenPhotoUrls.has(dedupKey)) {
-                    seenPhotoUrls.add(dedupKey);
-                    newPhotos.push(upscaled);
-                  }
-                }
-
-                // Append scraped photos
                 if (newPhotos.length > 0) photos = photos.concat(newPhotos);
                 scrapeDebug.found = newPhotos.length;
-                scrapeDebug.rawMatches = rawMatches.length;
-                scrapeDebug.decodedMatches = decodedMatches.length;
+                scrapeDebug.nextDataFound = nextDataFound;
+                scrapeDebug.propertyNodeFound = propertyNodeFound;
               } else {
                 scrapeDebug.error = 'page returned ' + pageResp.status;
               }
