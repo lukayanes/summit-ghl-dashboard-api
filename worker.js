@@ -2412,12 +2412,10 @@ export default {
         }
       }
 
-      // Redfin photo scraper — property-scoped to avoid mixing photos from nearby listings.
-      // Uses Redfin's /stingray/api/home/details/v1/photoUrls?propertyId=<id> endpoint which
-      // is per-property. Falls back to og:image only (single hero photo). We deliberately do
-      // NOT scrape arbitrary CDN URLs from the page because the listing HTML embeds nearby
-      // and "similar" property photos that would mix into the gallery.
-      // Cached in KV for 24h on success.
+      // Redfin photo scraper — uses Redfin's stingray/aboveTheFold API which is per-property.
+      // Walks ONLY the mediaBrowserInfo subtree (the property's own photo gallery) to avoid
+      // accidentally pulling photos from nested "similar listings" or "estimate" sections.
+      // Cache key versioned to bust old responses.
       if (pathname === '/api/redfin/photos') {
         const targetUrl = url.searchParams.get('url');
         if (!targetUrl) return errorResponse('url parameter required');
@@ -2425,7 +2423,7 @@ export default {
           return errorResponse('url must be a redfin.com URL');
         }
 
-        const cacheKey = 'redfin_photos_v3_' + targetUrl;
+        const cacheKey = 'redfin_photos_v4_' + targetUrl;
         if (env.SELLER_PHOTOS) {
           const cached = await env.SELLER_PHOTOS.get(cacheKey);
           if (cached) {
@@ -2447,24 +2445,19 @@ export default {
           'Referer': 'https://www.google.com/',
         };
 
+        // Strict filter: only full-res photos from this property's gallery
         const rankAndDedup = (candidates) => {
           const filtered = candidates
-            // Must be a Redfin CDN photo URL
             .filter(u => /^https?:\/\/ssl\.cdn-redfin\.com\/photo\//i.test(u))
-            // Reject ALL known thumbnail/preview generators — keep only genMid (gallery res)
             .filter(u => /genMid\./i.test(u))
-            // Must have a valid photo index suffix like _0, _1, etc. (rejects template URLs)
             .filter(u => /\.\d+_\d+\.(?:jpg|jpeg|png|webp)/i.test(u))
-            // Only full-res bigphoto path (skip islphoto/mbphoto/listphoto entirely)
             .filter(u => /\/bigphoto\//i.test(u))
             .map(u => {
               const idMatch = u.match(/genMid\.(\d+_\d+)\.(?:jpg|jpeg|png|webp)/i);
               return { url: u, idKey: idMatch ? idMatch[1] : u };
             });
-          // Dedup by photo identity
           const byId = {};
           filtered.forEach(r => { if (!byId[r.idKey]) byId[r.idKey] = r.url; });
-          // Sort by photo index for natural display order (front → kitchen → bedroom...)
           return Object.entries(byId)
             .sort(([a], [b]) => {
               const ai = parseInt((a.split('_')[1] || '0'), 10);
@@ -2474,10 +2467,10 @@ export default {
             .map(([, u]) => u);
         };
 
-        // === STRATEGY 1: Property-scoped /photoUrls API ===
+        // === STRATEGY 1: aboveTheFold API — walk ONLY mediaBrowserInfo subtree ===
         if (propertyId) {
           try {
-            const apiUrl = 'https://www.redfin.com/stingray/api/home/details/v1/photoUrls?propertyId=' + propertyId;
+            const apiUrl = 'https://www.redfin.com/stingray/api/home/details/aboveTheFold?accessLevel=1&propertyId=' + propertyId;
             const r = await fetch(apiUrl, {
               headers: {
                 ...browserHeaders,
@@ -2486,22 +2479,45 @@ export default {
                 'X-Requested-With': 'XMLHttpRequest',
               },
             });
-            const attempt = { strategy: 'photoUrls', status: r.status, found: 0 };
+            const attempt = { strategy: 'aboveTheFold', status: r.status, found: 0 };
             if (r.ok) {
               let body = await r.text();
               body = body.replace(/^\{\}&&/, '').trim();
               attempt.contentLength = body.length;
               try {
                 const j = JSON.parse(body);
+                // Try several known paths to the property's photo array. The "mediaBrowserInfo"
+                // subtree is the gallery for THIS property. Avoid walking siblings like
+                // "publicRecords", "schools", or anything related to nearby/similar listings.
+                const galleryPaths = [
+                  ['payload', 'mediaBrowserInfo'],
+                  ['payload', 'mediaBrowserInfoBean'],
+                  ['payload', 'aboveTheFold', 'mediaBrowserInfo'],
+                  ['payload', 'photos'],
+                ];
+                let scope = null;
+                for (const path of galleryPaths) {
+                  let cursor = j;
+                  for (const seg of path) {
+                    if (cursor && typeof cursor === 'object' && seg in cursor) cursor = cursor[seg];
+                    else { cursor = null; break; }
+                  }
+                  if (cursor) { scope = cursor; attempt.path = path.join('.'); break; }
+                }
                 const candidates = [];
-                const walk = (node) => {
-                  if (!node) return;
-                  if (typeof node === 'string') {
-                    if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\//.test(node)) candidates.push(node);
-                  } else if (Array.isArray(node)) node.forEach(walk);
-                  else if (typeof node === 'object') Object.values(node).forEach(walk);
-                };
-                walk(j);
+                if (scope) {
+                  // Walk ONLY this scoped subtree
+                  const walk = (node) => {
+                    if (!node) return;
+                    if (typeof node === 'string') {
+                      if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\//.test(node)) candidates.push(node);
+                    } else if (Array.isArray(node)) node.forEach(walk);
+                    else if (typeof node === 'object') Object.values(node).forEach(walk);
+                  };
+                  walk(scope);
+                } else {
+                  attempt.path = 'no-scope-found';
+                }
                 const ordered = rankAndDedup(candidates);
                 ordered.forEach(u => { if (!seen.has(u)) { seen.add(u); photos.push(u); } });
                 attempt.found = photos.length;
@@ -2512,11 +2528,11 @@ export default {
             }
             debug.attempts.push(attempt);
           } catch (e) {
-            debug.attempts.push({ strategy: 'photoUrls', error: e.message });
+            debug.attempts.push({ strategy: 'aboveTheFold', error: e.message });
           }
         }
 
-        // === STRATEGY 2: og:image only fallback (single hero photo, property-scoped) ===
+        // === STRATEGY 2: og:image only fallback (single hero photo) ===
         if (photos.length === 0) {
           try {
             const r = await fetch(targetUrl, { headers: browserHeaders });
@@ -2774,28 +2790,49 @@ export default {
           if (realtorPermalink && photos.length < 5) {
             try {
               const seenPhotoUrls = new Set(photos.map(p => p.replace(/-w\d+_h\d+/, '')));
-              const pageResp = await fetch(realtorPermalink, {
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                  'Accept-Language': 'en-US,en;q=0.9',
-                  'Referer': 'https://www.google.com/',
-                  'Sec-Fetch-Dest': 'document',
-                  'Sec-Fetch-Mode': 'navigate',
-                  'Sec-Fetch-Site': 'cross-site',
-                  'Upgrade-Insecure-Requests': '1',
-                },
-              });
-              scrapeDebug = { status: pageResp.status, contentLength: 0, found: 0 };
-              if (pageResp.ok) {
-                let pageHtml = await pageResp.text();
-                scrapeDebug.contentLength = pageHtml.length;
+              // Try the mobile Realtor URL first — has lighter bot detection than desktop.
+              // Convert the permalink: realtor.com/realestateandhomes-detail/... -> m.realtor.com/realestateandhomes-detail/...
+              const mobilePermalink = realtorPermalink.replace(/^https:\/\/www\.realtor\.com\//, 'https://m.realtor.com/');
+              const attemptUrls = [mobilePermalink, realtorPermalink];
+              let pageResp = null;
+              let pageHtml = '';
+              let pageUrlUsed = null;
+              for (const tryUrl of attemptUrls) {
+                try {
+                  // Cookies: add a synthetic Cookie header that mimics a normal session.
+                  // Realtor's bot detection looks for a missing Cookie or known-bad UA fingerprints.
+                  pageResp = await fetch(tryUrl, {
+                    headers: {
+                      'User-Agent': /m\.realtor\.com/.test(tryUrl)
+                        ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+                        : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                      'Accept-Language': 'en-US,en;q=0.9',
+                      'Referer': 'https://www.google.com/',
+                      'Sec-Fetch-Dest': 'document',
+                      'Sec-Fetch-Mode': 'navigate',
+                      'Sec-Fetch-Site': 'cross-site',
+                      'Upgrade-Insecure-Requests': '1',
+                      'Cookie': 'split=n; site-pref=dom; visit_id=' + Math.random().toString(36).substring(2, 12),
+                    },
+                  });
+                  if (pageResp.ok) {
+                    pageHtml = await pageResp.text();
+                    if (pageHtml && pageHtml.length > 5000) {
+                      pageUrlUsed = tryUrl;
+                      break;
+                    }
+                  }
+                } catch (_) { /* try next URL */ }
+              }
+              scrapeDebug = { status: pageResp ? pageResp.status : 0, contentLength: pageHtml.length, found: 0, urlUsed: pageUrlUsed };
 
+              if (pageHtml && pageHtml.length > 5000) {
                 // Realtor.com is a Next.js app. Page state lives in:
                 //   <script id="__NEXT_DATA__" type="application/json">{...}</script>
                 // The TARGET property's photos sit at a scoped path inside that JSON, while
-                // "nearby"/"similar" properties live under different keys. We extract photos
-                // by walking ONLY the property's own subtree to avoid mixing in neighbors.
+                // "nearby"/"similar" properties live under different keys. Walk ONLY the
+                // property's own subtree to avoid mixing in neighbors.
                 const nextDataRe = /<script[^>]+id\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i;
                 const nextMatch = pageHtml.match(nextDataRe);
                 const newPhotos = [];
@@ -2879,7 +2916,7 @@ export default {
                 scrapeDebug.nextDataFound = nextDataFound;
                 scrapeDebug.propertyNodeFound = propertyNodeFound;
               } else {
-                scrapeDebug.error = 'page returned ' + pageResp.status;
+                scrapeDebug.error = 'page returned ' + (pageResp ? pageResp.status : 'no-response') + ' (len=' + pageHtml.length + ')';
               }
             } catch (scrapeErr) {
               scrapeDebug = { error: scrapeErr.message };
