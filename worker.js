@@ -2412,10 +2412,206 @@ export default {
         }
       }
 
-      // Legacy Redfin photo endpoint — redirects to Zillow address lookup
-      // (Redfin blocks server-side page fetches from Cloudflare Workers)
+      // Redfin photo scraper — tries multiple strategies in order:
+      //  1) Redfin's internal stingray/api/home/details/aboveTheFold JSON (richest, no captcha)
+      //  2) Listing page HTML scrape with browser headers (og:image + JSON-LD + CDN regex)
+      //  3) Photo-specific URL variant (?widgetType=photos)
+      // Always returns a debug object so we can tell which strategy worked or why each failed.
+      // Cached in KV for 24h on success. Caller passes ?url=<comp.redfinUrl>.
       if (pathname === '/api/redfin/photos') {
-        return jsonResponse({ photos: [], photoCount: 0, error: 'Use /api/zillow/photos-by-address instead', source: 'redfin' });
+        const targetUrl = url.searchParams.get('url');
+        if (!targetUrl) return errorResponse('url parameter required');
+        if (!/^https?:\/\/(www\.)?redfin\.com\//i.test(targetUrl)) {
+          return errorResponse('url must be a redfin.com URL');
+        }
+
+        const cacheKey = 'redfin_photos_' + targetUrl;
+        if (env.SELLER_PHOTOS) {
+          const cached = await env.SELLER_PHOTOS.get(cacheKey);
+          if (cached) {
+            try { return jsonResponse({ ...JSON.parse(cached), cached: true }); } catch (_) {}
+          }
+        }
+
+        const debug = { url: targetUrl, attempts: [] };
+        const photos = [];
+        const seen = new Set();
+        const add = (u) => {
+          if (!u || typeof u !== 'string') return;
+          let clean = u.replace(/&amp;/g, '&').trim();
+          if (!/^https?:\/\//i.test(clean)) return;
+          // Upscale low-res variants to full-size
+          clean = clean.replace('/islphoto/', '/bigphoto/').replace('/mbphoto/', '/bigphoto/');
+          if (seen.has(clean)) return;
+          seen.add(clean);
+          photos.push(clean);
+        };
+
+        // Extract Redfin property ID from URL — used by the internal API fallback.
+        // Patterns: /STATE/CITY/STREET-Home/123456789 or /STATE/CITY/STREET/home/123456789
+        const idMatch = targetUrl.match(/(?:home\/|-Home\/)(\d{4,12})/i);
+        const propertyId = idMatch ? idMatch[1] : null;
+        debug.propertyId = propertyId;
+
+        // Browser-like headers used across all attempts
+        const browserHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'cross-site',
+          'Sec-Fetch-User': '?1',
+          'Upgrade-Insecure-Requests': '1',
+          'Referer': 'https://www.google.com/',
+        };
+
+        // Helper: extract photo URLs from a chunk of HTML using all known patterns
+        const harvestHtml = (html) => {
+          let count = 0;
+          // og:image / twitter:image meta tags
+          const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
+          let m;
+          while ((m = metaRe.exec(html)) !== null) { add(m[1]); count++; }
+
+          // Direct CDN URLs anywhere in HTML
+          const cdnRe = /https?:\/\/ssl\.cdn-redfin\.com\/photo\/[^\s"'\\<>)]+\.(?:jpg|jpeg|png|webp)/gi;
+          const cdnMatches = html.match(cdnRe) || [];
+          cdnMatches.forEach(u => { add(u); count++; });
+
+          // JSON-LD structured data
+          const ldRe = /<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+          let ldMatch;
+          while ((ldMatch = ldRe.exec(html)) !== null) {
+            try {
+              const obj = JSON.parse(ldMatch[1].trim());
+              const drain = (node) => {
+                if (!node) return;
+                if (typeof node === 'string' && /^https?:\/\//.test(node) && /\.(jpg|jpeg|png|webp)/i.test(node)) { add(node); count++; }
+                else if (Array.isArray(node)) node.forEach(drain);
+                else if (typeof node === 'object') {
+                  if (node.image) drain(node.image);
+                  if (node.url && /\.(jpg|jpeg|png|webp)/i.test(node.url)) drain(node.url);
+                  if (node.contentUrl) drain(node.contentUrl);
+                }
+              };
+              drain(obj);
+            } catch (_) {}
+          }
+          return count;
+        };
+
+        // === STRATEGY 1: Redfin's internal photos API (stingray) ===
+        // Pulls every photo with captions from Redfin's own JSON. No captcha when called
+        // with the right Referer/User-Agent. Requires a property ID extracted from the URL.
+        if (propertyId) {
+          const apiUrls = [
+            'https://www.redfin.com/stingray/api/home/details/v1/photoUrls?propertyId=' + propertyId,
+            'https://www.redfin.com/stingray/api/home/details/aboveTheFold?accessLevel=1&propertyId=' + propertyId,
+          ];
+          for (const apiUrl of apiUrls) {
+            try {
+              const r = await fetch(apiUrl, {
+                headers: {
+                  ...browserHeaders,
+                  'Accept': 'application/json, text/plain, */*',
+                  'Referer': targetUrl,
+                  'X-Requested-With': 'XMLHttpRequest',
+                },
+              });
+              const attempt = { strategy: 'stingray', url: apiUrl, status: r.status, found: 0 };
+              if (r.ok) {
+                let body = await r.text();
+                // Redfin's JSON responses are prefixed with "{}&&" to prevent JSONP hijacking
+                body = body.replace(/^\{\}&&/, '').trim();
+                attempt.contentLength = body.length;
+                try {
+                  const j = JSON.parse(body);
+                  const before = photos.length;
+                  const walk = (node) => {
+                    if (!node) return;
+                    if (typeof node === 'string') {
+                      if (/^https?:\/\/ssl\.cdn-redfin\.com\/photo\//.test(node)) add(node);
+                    } else if (Array.isArray(node)) node.forEach(walk);
+                    else if (typeof node === 'object') Object.values(node).forEach(walk);
+                  };
+                  walk(j);
+                  attempt.found = photos.length - before;
+                } catch (parseErr) {
+                  attempt.parseError = parseErr.message;
+                }
+              }
+              debug.attempts.push(attempt);
+              if (photos.length >= 5) break; // good enough, skip remaining strategies
+            } catch (e) {
+              debug.attempts.push({ strategy: 'stingray', url: apiUrl, error: e.message });
+            }
+          }
+        }
+
+        // === STRATEGY 2: Scrape the listing page HTML ===
+        if (photos.length < 5) {
+          try {
+            const r = await fetch(targetUrl, { headers: browserHeaders });
+            const attempt = { strategy: 'listing-page', status: r.status, found: 0 };
+            if (r.ok) {
+              const html = await r.text();
+              attempt.contentLength = html.length;
+              // Detect block/captcha pages (short body, captcha keywords, or "challenge" page)
+              if (html.length < 800 || /access[\s-]?denied|cf-error|distil_|px-captcha|forbidden/i.test(html.substring(0, 2000))) {
+                attempt.error = 'blocked/captcha page (len=' + html.length + ')';
+              } else {
+                const before = photos.length;
+                harvestHtml(html);
+                attempt.found = photos.length - before;
+              }
+            } else {
+              attempt.error = 'http ' + r.status;
+            }
+            debug.attempts.push(attempt);
+          } catch (e) {
+            debug.attempts.push({ strategy: 'listing-page', error: e.message });
+          }
+        }
+
+        // === STRATEGY 3: Photo widget variant URL ===
+        // Some Redfin pages expose a deeper gallery view at the same URL + ?widgetType=photos
+        if (photos.length < 5) {
+          try {
+            const widgetUrl = targetUrl + (targetUrl.includes('?') ? '&' : '?') + 'widgetType=photos';
+            const r = await fetch(widgetUrl, { headers: browserHeaders });
+            const attempt = { strategy: 'widget-page', status: r.status, found: 0 };
+            if (r.ok) {
+              const html = await r.text();
+              attempt.contentLength = html.length;
+              const before = photos.length;
+              harvestHtml(html);
+              attempt.found = photos.length - before;
+            } else {
+              attempt.error = 'http ' + r.status;
+            }
+            debug.attempts.push(attempt);
+          } catch (e) {
+            debug.attempts.push({ strategy: 'widget-page', error: e.message });
+          }
+        }
+
+        const result = {
+          url: targetUrl,
+          photos,
+          photoCount: photos.length,
+          source: 'redfin',
+          debug,
+        };
+
+        // Cache for 24h on success
+        if (env.SELLER_PHOTOS && photos.length > 0) {
+          await env.SELLER_PHOTOS.put(cacheKey, JSON.stringify(result), { expirationTtl: 86400 });
+        }
+
+        return jsonResponse(result);
       }
 
       // Realtor.com: Search sold properties by location
@@ -2630,6 +2826,68 @@ export default {
             realtorPermalink = 'https://www.realtor.com/realestateandhomes-detail/' + matchedProperty.permalink;
           }
 
+          // === PAGE-SCRAPE FALLBACK ===
+          // The realtor-data1 API caps sold-property photos at ~3. When we have a permalink
+          // but only a few photos, fetch the actual Realtor.com listing page and extract
+          // all rdcpix.com photo URLs from the HTML for the full gallery (typically 20-50).
+          let scrapeDebug = null;
+          if (realtorPermalink && photos.length < 5) {
+            try {
+              const seenPhotoUrls = new Set(photos.map(p => p.replace(/-w\d+_h\d+/, '')));
+              const pageResp = await fetch(realtorPermalink, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  'Referer': 'https://www.google.com/',
+                  'Sec-Fetch-Dest': 'document',
+                  'Sec-Fetch-Mode': 'navigate',
+                  'Sec-Fetch-Site': 'cross-site',
+                  'Upgrade-Insecure-Requests': '1',
+                },
+              });
+              scrapeDebug = { status: pageResp.status, contentLength: 0, found: 0 };
+              if (pageResp.ok) {
+                const pageHtml = await pageResp.text();
+                scrapeDebug.contentLength = pageHtml.length;
+
+                // Pull all rdcpix.com photo URLs from the HTML (CDN that hosts Realtor photos)
+                const cdnRe = /https?:\/\/[a-z0-9.\-]*rdcpix\.com\/[^\s"'\\<>)]+\.(?:jpg|jpeg|png|webp)/gi;
+                const matches = pageHtml.match(cdnRe) || [];
+                const newPhotos = [];
+                matches.forEach(u => {
+                  // Upscale thumb suffix to full-size: ...abc123s.jpg -> ...abc123od-w1024_h768.jpg
+                  const upscaled = u.replace(/(rdcpix\.com\/[^?]+?)([a-z])(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '$1od-w1024_h768$3$5');
+                  const dedupKey = upscaled.replace(/-w\d+_h\d+/, '');
+                  if (!seenPhotoUrls.has(dedupKey)) {
+                    seenPhotoUrls.add(dedupKey);
+                    newPhotos.push(upscaled);
+                  }
+                });
+
+                // Also pull og:image / twitter:image
+                const metaRe = /<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image|og:image:url|og:image:secure_url)["'][^>]+content\s*=\s*["']([^"']+)["']/gi;
+                let mm;
+                while ((mm = metaRe.exec(pageHtml)) !== null) {
+                  const u = mm[1].replace(/&amp;/g, '&');
+                  const dedupKey = u.replace(/-w\d+_h\d+/, '');
+                  if (/^https?:\/\//i.test(u) && !seenPhotoUrls.has(dedupKey)) {
+                    seenPhotoUrls.add(dedupKey);
+                    newPhotos.push(u);
+                  }
+                }
+
+                // Append scraped photos to whatever the API gave us
+                if (newPhotos.length > 0) photos = photos.concat(newPhotos);
+                scrapeDebug.found = newPhotos.length;
+              } else {
+                scrapeDebug.error = 'page returned ' + pageResp.status;
+              }
+            } catch (scrapeErr) {
+              scrapeDebug = { error: scrapeErr.message };
+            }
+          }
+
           debugInfo = {
             method: 'realtor_data_api',
             strategies: triedStrategies,
@@ -2638,6 +2896,7 @@ export default {
             matchedId: matchedPropId,
             matchedAddr,
             photoCount: photos.length,
+            scrape: scrapeDebug,
             matchedKeys: matchedProperty ? Object.keys(matchedProperty).slice(0, 15) : [],
           };
 
