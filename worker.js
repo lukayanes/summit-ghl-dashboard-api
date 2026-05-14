@@ -2275,6 +2275,25 @@ function errorResponse(message, status = 400) {
 }
 
 /**
+ * proxyFetch — routes a fetch through ScraperAPI when env.SCRAPER_API_KEY is set.
+ * When the key is absent, behavior is identical to a normal fetch (current free behavior).
+ * ScraperAPI rotates residential IPs to bypass Realtor/Redfin's bot blocks.
+ * Costs 1 credit per call on standard sites (5 for premium proxies, which we don't use).
+ */
+async function proxyFetch(targetUrl, options, env) {
+  if (!env || !env.SCRAPER_API_KEY) {
+    return fetch(targetUrl, options);
+  }
+  // ScraperAPI passes our request headers through with keep_headers=true.
+  // country_code=us ensures the IP is US-based so we get the right Realtor/Redfin geo content.
+  const proxyUrl = 'https://api.scraperapi.com/?api_key=' + env.SCRAPER_API_KEY
+    + '&url=' + encodeURIComponent(targetUrl)
+    + '&country_code=us'
+    + '&keep_headers=true';
+  return fetch(proxyUrl, options);
+}
+
+/**
  * Main Worker request handler
  */
 export default {
@@ -2568,14 +2587,14 @@ export default {
         if (propertyId) {
           try {
             const apiUrl = 'https://www.redfin.com/stingray/api/home/details/aboveTheFold?accessLevel=1&propertyId=' + propertyId;
-            const r = await fetch(apiUrl, {
+            const r = await proxyFetch(apiUrl, {
               headers: {
                 ...browserHeaders,
                 'Accept': 'application/json, text/plain, */*',
                 'Referer': targetUrl,
                 'X-Requested-With': 'XMLHttpRequest',
               },
-            });
+            }, env);
             const attempt = { strategy: 'aboveTheFold', status: r.status, found: 0 };
             if (r.ok) {
               let body = await r.text();
@@ -2632,7 +2651,7 @@ export default {
         // === STRATEGY 2: og:image only fallback (single hero photo) ===
         if (photos.length === 0) {
           try {
-            const r = await fetch(targetUrl, { headers: browserHeaders });
+            const r = await proxyFetch(targetUrl, { headers: browserHeaders }, env);
             const attempt = { strategy: 'og-image', status: r.status, found: 0 };
             if (r.ok) {
               const html = await r.text();
@@ -2898,7 +2917,8 @@ export default {
                 try {
                   // Cookies: add a synthetic Cookie header that mimics a normal session.
                   // Realtor's bot detection looks for a missing Cookie or known-bad UA fingerprints.
-                  pageResp = await fetch(tryUrl, {
+                  // Routed through SCRAPER_API_KEY proxy when set, otherwise direct.
+                  pageResp = await proxyFetch(tryUrl, {
                     headers: {
                       'User-Agent': /m\.realtor\.com/.test(tryUrl)
                         ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
@@ -2912,7 +2932,7 @@ export default {
                       'Upgrade-Insecure-Requests': '1',
                       'Cookie': 'split=n; site-pref=dom; visit_id=' + Math.random().toString(36).substring(2, 12),
                     },
-                  });
+                  }, env);
                   if (pageResp.ok) {
                     pageHtml = await pageResp.text();
                     if (pageHtml && pageHtml.length > 5000) {
