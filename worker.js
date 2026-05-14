@@ -2350,17 +2350,19 @@ async function proxyFetch(targetUrl, options, env) {
   if (!env || !env.SCRAPER_API_KEY) {
     return fetch(targetUrl, options);
   }
-  // Realtor.com and Redfin block standard datacenter proxies aggressively (they hit you with
-  // 429/499/403). ScraperAPI's `premium=true` flag routes through residential IPs that have
-  // a much higher success rate on these specific sites. Costs 10 credits per call vs 1 for
-  // standard, but standard mode doesn't actually work for these targets.
+  // Realtor.com and Redfin require ScraperAPI's `ultra_premium=true` flag — premium alone
+  // returns the error "Protected domains may require ultra_premium=true". Ultra premium uses
+  // their best residential IPs with built-in retry logic. Costs 25 credits per call vs 10
+  // for premium and 1 for standard, but these sites won't unblock without it.
   // keep_headers=true passes our User-Agent / Cookie / Referer through to the target.
-  const needsPremium = /realtor\.com|redfin\.com/i.test(targetUrl);
+  // session_number creates a sticky residential session so retries from a single deal lookup
+  // reuse the same IP (cheaper than re-rotating per call).
+  const needsUltra = /realtor\.com|redfin\.com/i.test(targetUrl);
   const proxyUrl = 'https://api.scraperapi.com/?api_key=' + env.SCRAPER_API_KEY
     + '&url=' + encodeURIComponent(targetUrl)
     + '&country_code=us'
     + '&keep_headers=true'
-    + (needsPremium ? '&premium=true' : '');
+    + (needsUltra ? '&ultra_premium=true' : '');
   return fetch(proxyUrl, options);
 }
 
