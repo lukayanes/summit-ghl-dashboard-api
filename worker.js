@@ -1782,7 +1782,73 @@ async function findComps(address, daysBack, env, radiusMiles = 1.0) {
       }
 
       if (matched) {
-        const d = matched.description || matched;
+        let d = matched.description || matched;
+
+        // If the API response didn't include description.beds (common for zip_search results),
+        // fetch the actual Realtor.com listing page via proxy and pull beds/baths/sqft from
+        // the __NEXT_DATA__ JSON state object. This requires SCRAPER_API_KEY to bypass blocks.
+        if (!d.beds && !d.beds_min && matched.property_id) {
+          try {
+            const matchedAddrLine = matched.location?.address?.line || matched.address?.line;
+            const matchedCity = matched.location?.address?.city || cityPart;
+            const matchedState = matched.location?.address?.state_code || statePart;
+            const matchedZip = matched.location?.address?.postal_code || searchZip;
+            if (matchedAddrLine && matchedCity && matchedState) {
+              const slug = matchedAddrLine.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-]/g, '')
+                + '_' + matchedCity.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-]/g, '')
+                + '_' + matchedState
+                + (matchedZip ? '_' + matchedZip : '')
+                + '_M' + String(matched.property_id).substring(0, 5) + '-' + String(matched.property_id).substring(5);
+              const pageUrl = 'https://www.realtor.com/realestateandhomes-detail/' + slug;
+              const pageResp = await proxyFetch(pageUrl, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Referer': 'https://www.google.com/',
+                },
+              }, env);
+              if (pageResp.ok) {
+                const pageHtml = await pageResp.text();
+                const ndm = pageHtml.match(/<script[^>]+id\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+                if (ndm) {
+                  try {
+                    const state = JSON.parse(ndm[1]);
+                    // Walk the JSON looking for our property's description
+                    const targetIdStr = String(matched.property_id);
+                    let foundDesc = null;
+                    const walk = (n, depth) => {
+                      if (!n || depth > 8 || foundDesc) return;
+                      if (Array.isArray(n)) { n.forEach(x => walk(x, depth + 1)); return; }
+                      if (typeof n === 'object') {
+                        if (String(n.property_id || '') === targetIdStr && n.description) {
+                          foundDesc = n.description;
+                          return;
+                        }
+                        Object.values(n).forEach(v => walk(v, depth + 1));
+                      }
+                    };
+                    walk(state, 0);
+                    if (foundDesc) {
+                      d = foundDesc;
+                      subject._realtorPageScrape = { used: true, source: '__NEXT_DATA__' };
+                    } else {
+                      subject._realtorPageScrape = { used: false, reason: 'description node not found in __NEXT_DATA__' };
+                    }
+                  } catch (parseErr) {
+                    subject._realtorPageScrape = { used: false, error: 'JSON parse: ' + parseErr.message };
+                  }
+                } else {
+                  subject._realtorPageScrape = { used: false, reason: '__NEXT_DATA__ not in HTML' };
+                }
+              } else {
+                subject._realtorPageScrape = { used: false, error: 'page returned ' + pageResp.status };
+              }
+            }
+          } catch (scrapeErr) {
+            subject._realtorPageScrape = { used: false, error: scrapeErr.message };
+          }
+        }
+
         const overridden = [];
         // Realtor wins on property attrs — override Zillow's values whenever Realtor has data.
         const realtorBeds = d.beds || d.beds_min;
@@ -2284,12 +2350,17 @@ async function proxyFetch(targetUrl, options, env) {
   if (!env || !env.SCRAPER_API_KEY) {
     return fetch(targetUrl, options);
   }
-  // ScraperAPI passes our request headers through with keep_headers=true.
-  // country_code=us ensures the IP is US-based so we get the right Realtor/Redfin geo content.
+  // Realtor.com and Redfin block standard datacenter proxies aggressively (they hit you with
+  // 429/499/403). ScraperAPI's `premium=true` flag routes through residential IPs that have
+  // a much higher success rate on these specific sites. Costs 10 credits per call vs 1 for
+  // standard, but standard mode doesn't actually work for these targets.
+  // keep_headers=true passes our User-Agent / Cookie / Referer through to the target.
+  const needsPremium = /realtor\.com|redfin\.com/i.test(targetUrl);
   const proxyUrl = 'https://api.scraperapi.com/?api_key=' + env.SCRAPER_API_KEY
     + '&url=' + encodeURIComponent(targetUrl)
     + '&country_code=us'
-    + '&keep_headers=true';
+    + '&keep_headers=true'
+    + (needsPremium ? '&premium=true' : '');
   return fetch(proxyUrl, options);
 }
 
