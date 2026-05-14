@@ -1725,6 +1725,103 @@ async function findComps(address, daysBack, env, radiusMiles = 1.0) {
     lastSaleDate: lastSaleDate || null,
   };
 
+  // === SUBJECT DATA: Realtor is the source of truth for property attributes ===
+  // Realtor's data comes from the MLS feed and is generally more accurate than Zillow's
+  // algorithmic guesses for beds/baths/sqft/year/lot. We ALWAYS query Realtor and let it
+  // override Zillow's attribute values when it has them. Zillow still owns photos, zpid,
+  // location, zestimate, and last-sold history — Realtor only takes property attrs.
+  // _sourceMap tracks which source provided each field for audit.
+  subject._sourceMap = {
+    bedrooms: subject.bedrooms ? 'zillow' : null,
+    bathrooms: subject.bathrooms ? 'zillow' : null,
+    livingArea: subject.livingArea ? 'zillow' : null,
+    yearBuilt: subject.yearBuilt ? 'zillow' : null,
+    lotSize: subject.lotSize ? 'zillow' : null,
+  };
+
+  if (env.REALTOR_API_KEY || env.ZILLOW_API_KEY) {
+    try {
+      const addrParts = address.split(',').map(s => s.trim());
+      const streetRaw = addrParts[0] || '';
+      const cityPart = addrParts[1] || '';
+      const stateZipPart = addrParts.length >= 3 ? addrParts.slice(2).join(' ').trim() : '';
+      const sm = stateZipPart.match(/([A-Z]{2})/);
+      const statePart = sm ? sm[1] : '';
+      const zipMatch = address.match(/\b(\d{5})\b/);
+      const searchZip = zipMatch ? zipMatch[1] : null;
+      const streetNumMatch = streetRaw.match(/^(\d+)/);
+      const streetNum = streetNumMatch ? streetNumMatch[1] : '';
+
+      // Fuzzy match helper — confirms a Realtor result is actually our target address
+      const fuzzyMatch = (rp) => {
+        const line = (rp.location?.address?.line || rp.address?.line || '').toLowerCase();
+        if (!line || !streetRaw) return false;
+        const streetNorm = streetRaw.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const lineNorm = line.replace(/[^a-z0-9]/g, '');
+        if (lineNorm.includes(streetNorm) || streetNorm.includes(lineNorm)) return true;
+        return streetNum && line.startsWith(streetNum + ' ');
+      };
+
+      let matched = null;
+      const tryQueries = [];
+      if (streetRaw && cityPart && statePart) {
+        tryQueries.push({ query: { street_name: streetRaw, city: cityPart, state_code: statePart }, limit: 10, offset: 0 });
+      }
+      if (searchZip) {
+        tryQueries.push({ query: { postal_code: searchZip }, limit: 42, offset: 0 });
+      }
+
+      for (const body of tryQueries) {
+        if (matched) break;
+        try {
+          const data = await realtorDataRequest('/property_list/', body, env);
+          const props = data?.data?.home_search?.properties || data?.home_search?.properties || data?.properties || data?.data?.properties || [];
+          matched = props.find(fuzzyMatch);
+          if (matched) break;
+        } catch (_) { /* try next strategy */ }
+      }
+
+      if (matched) {
+        const d = matched.description || matched;
+        const overridden = [];
+        // Realtor wins on property attrs — override Zillow's values whenever Realtor has data.
+        const realtorBeds = d.beds || d.beds_min;
+        const realtorBaths = parseFloat(d.baths_consolidated) || d.baths || d.baths_full;
+        if (realtorBeds) {
+          if (subject.bedrooms !== realtorBeds) overridden.push({ field: 'bedrooms', zillow: subject.bedrooms, realtor: realtorBeds });
+          subject.bedrooms = realtorBeds;
+          subject._sourceMap.bedrooms = 'realtor';
+        }
+        if (realtorBaths) {
+          if (subject.bathrooms !== realtorBaths) overridden.push({ field: 'bathrooms', zillow: subject.bathrooms, realtor: realtorBaths });
+          subject.bathrooms = realtorBaths;
+          subject._sourceMap.bathrooms = 'realtor';
+        }
+        if (d.sqft) {
+          if (subject.livingArea !== d.sqft) overridden.push({ field: 'livingArea', zillow: subject.livingArea, realtor: d.sqft });
+          subject.livingArea = d.sqft;
+          subject._sourceMap.livingArea = 'realtor';
+        }
+        if (d.year_built) {
+          if (subject.yearBuilt !== d.year_built) overridden.push({ field: 'yearBuilt', zillow: subject.yearBuilt, realtor: d.year_built });
+          subject.yearBuilt = d.year_built;
+          subject._sourceMap.yearBuilt = 'realtor';
+        }
+        if (d.lot_sqft) {
+          if (subject.lotSize !== d.lot_sqft) overridden.push({ field: 'lotSize', zillow: subject.lotSize, realtor: d.lot_sqft });
+          subject.lotSize = d.lot_sqft;
+          subject._sourceMap.lotSize = 'realtor';
+        }
+        if (d.type || d.sub_type) subject.propertyType = d.type || d.sub_type;
+        subject._realtorFallback = { used: true, propertyId: matched.property_id, overridden };
+      } else {
+        subject._realtorFallback = { used: false, reason: 'no match' };
+      }
+    } catch (e) {
+      subject._realtorFallback = { used: false, error: e.message };
+    }
+  }
+
   // Step 2: Deep-extract property-like objects embedded in the Zillow response
   // These are typically immediate neighbors with Zestimates (used as fallback)
   const allExtracted = deepExtractProperties(propertyData, 0, 6, subject.zpid);
