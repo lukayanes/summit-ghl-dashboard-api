@@ -2612,7 +2612,7 @@ export default {
           return errorResponse('url must be a redfin.com URL');
         }
 
-        const cacheKey = 'redfin_photos_v4_' + targetUrl;
+        const cacheKey = 'redfin_photos_v5_' + targetUrl;
         if (env.SELLER_PHOTOS) {
           const cached = await env.SELLER_PHOTOS.get(cacheKey);
           if (cached) {
@@ -2753,7 +2753,9 @@ export default {
         }
 
         const result = { url: targetUrl, photos, photoCount: photos.length, source: 'redfin', debug };
-        if (env.SELLER_PHOTOS && photos.length > 0) {
+        if (env.SELLER_PHOTOS && photos.length >= 5) {
+          // Don't cache partial/failed responses (e.g. og-image fallback with 1 photo).
+          // That way the next call retries and gets a real gallery.
           await env.SELLER_PHOTOS.put(cacheKey, JSON.stringify(result), { expirationTtl: 86400 });
         }
         return jsonResponse(result);
