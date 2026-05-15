@@ -2788,11 +2788,25 @@ export default {
       }
 
       // Realtor.com: Get photos for a property by address using Realtor Data API (realtor-data1)
+      // Cached in SELLER_PHOTOS KV for 24h by normalized address. Cache only stores responses
+      // with >= 5 photos so partial/failed responses don't poison the cache.
       if (pathname === '/api/realtor/photos') {
         const propertyId = url.searchParams.get('property_id');
         const address = url.searchParams.get('address');
         if (!propertyId && !address) return errorResponse('property_id or address parameter required');
         if (!env.REALTOR_API_KEY && !env.ZILLOW_API_KEY) return errorResponse('No RapidAPI key configured', 500);
+
+        // Cache lookup — same key derivation used at write time below
+        const realtorCacheKey = 'realtor_photos_v1_' + String(address || propertyId || '').toLowerCase().replace(/[^a-z0-9]/g, '_');
+        if (env.SELLER_PHOTOS) {
+          try {
+            const cached = await env.SELLER_PHOTOS.get(realtorCacheKey);
+            if (cached) {
+              try { return jsonResponse({ ...JSON.parse(cached), cached: true }); } catch (_) {}
+            }
+          } catch (_) { /* cache miss is fine */ }
+        }
+
         try {
           let photos = [];
           let debugInfo = {};
@@ -3127,7 +3141,7 @@ export default {
             matchedKeys: matchedProperty ? Object.keys(matchedProperty).slice(0, 15) : [],
           };
 
-          return jsonResponse({
+          const response = {
             address,
             photos,
             photoCount: photos.length,
@@ -3135,7 +3149,17 @@ export default {
             property_id: matchedPropId,
             permalink: realtorPermalink,
             debug: debugInfo,
-          });
+          };
+
+          // Cache only when we got a substantial gallery — keeps the cache from holding onto
+          // 3-photo API fallbacks or empty results that should be retried next time.
+          if (env.SELLER_PHOTOS && photos.length >= 5) {
+            try {
+              await env.SELLER_PHOTOS.put(realtorCacheKey, JSON.stringify(response), { expirationTtl: 86400 });
+            } catch (_) { /* cache write best-effort */ }
+          }
+
+          return jsonResponse(response);
         } catch (e) {
           return jsonResponse({ photos: [], photoCount: 0, error: e.message, source: 'realtor' });
         }
