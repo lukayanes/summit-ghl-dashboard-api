@@ -596,15 +596,28 @@ async function redfinSearchSold(lat, lng, radiusMiles = 0.75, soldWithinDays = 1
       }
       if (!price || price < 10000) continue; // skip no-price or rental-like
 
-      // Determine price source based on status and date
-      let priceSource = 'redfin:price';
+      // Determine price source based on status and date.
+      // NOTE: This function queries Redfin's sold-only endpoint (status=9), so every
+      // row returned is a closed sale unless the status column explicitly says
+      // otherwise. Default to 'redfin:sold' so rows with a blank/unparseable SOLD
+      // DATE column still classify as sold downstream — Redfin occasionally returns
+      // sold rows where the date column didn't parse (e.g. re-listed property whose
+      // CSV status shifted to "Active" after the sold event).
+      //
+      // Priority: an explicit sold date always wins (closed transaction), then the
+      // status column for pending/active, then sold as the default fallback.
+      let priceSource = 'redfin:sold';
       if (soldDate) {
         priceSource = 'redfin:sold';
       } else if (rawStatus.includes('pending') || rawStatus.includes('contingent')) {
         priceSource = 'redfin:pending';
+      } else if (rawStatus.includes('active') || rawStatus.includes('for sale') || rawStatus.includes('coming soon')) {
+        // Currently listed with no sold date — treat as for-sale fallback
+        priceSource = 'redfin:for_sale';
       } else if (rawStatus.includes('sold')) {
         priceSource = 'redfin:sold';
       }
+      // else: default 'redfin:sold' (status=9 endpoint guarantees a closed sale)
 
       properties.push({
         address: fullAddr,
@@ -2119,21 +2132,41 @@ async function findComps(address, daysBack, env, radiusMiles = 1.0) {
     }
 
     // === COMP TYPE CLASSIFICATION ===
-    // Classify each comp into one of: sold, pending, for_sale, zestimate
+    // Classify each comp into one of: sold, pending, for_sale, zestimate.
+    //
+    // Ordering matters. We trust signals in this priority:
+    //   1. Explicit Zestimate / pending / for-sale price-source labels
+    //      (e.g. 'redfin:pending', 'redfin:for_sale', 'realtor:listPrice')
+    //   2. A real sold date (the strongest evidence of a closed transaction —
+    //      overrides stale Zillow homeStatus like 'FOR_SALE' on re-listed homes)
+    //   3. Any priceSource that semantically means "sold"
+    //   4. Any redfin/realtor source default (those endpoints return sold-only)
+    //   5. Generic status string fallback
     let compType = 'unknown';
-    if (priceSource === 'zestimate') {
+    const ps = (priceSource || '').toLowerCase();
+
+    if (ps === 'zestimate') {
       compType = 'zestimate';
-    } else if (priceSource && (priceSource.includes('sold') || priceSource === 'soldPrice' || priceSource === 'lastSoldPrice' || priceSource === 'lastSalePrice' || priceSource.includes('pending_before_sold'))) {
-      compType = 'sold';
-    } else if (priceSource && (priceSource.includes('pending') && !priceSource.includes('pending_before_sold'))) {
+    } else if (ps === 'redfin:pending' || (ps.includes('pending') && !ps.includes('pending_before_sold'))) {
       compType = 'pending';
-    } else if (compStatus.includes('for_sale') || compStatus.includes('active') || compStatus.includes('coming_soon') || compStatus.includes('new_listing')) {
+    } else if (ps === 'redfin:for_sale' || ps === 'realtor:listprice') {
       compType = 'for_sale';
     } else if (soldDateStr) {
-      compType = 'sold'; // has a sold date, treat as sold even if source is ambiguous
-    } else if (priceSource && priceSource.startsWith('price:')) {
+      // Real sold date beats stale homeStatus. Zillow often keeps homeStatus='FOR_SALE'
+      // on properties that just sold and got re-listed, or on listings with a recent
+      // sold event in priceHistory.
+      compType = 'sold';
+    } else if (ps.includes('sold') || ps === 'soldprice' || ps === 'lastsoldprice' || ps === 'lastsaleprice' || ps.includes('pending_before_sold') || ps.includes('listed_before_sold')) {
+      compType = 'sold';
+    } else if (ps.startsWith('redfin:') || ps.startsWith('realtor:')) {
+      // Both endpoints are sold-only searches. If we got here with one of those
+      // sources but no clearer label, it's still a sold comp.
+      compType = 'sold';
+    } else if (compStatus.includes('for_sale') || compStatus.includes('active') || compStatus.includes('coming_soon') || compStatus.includes('new_listing')) {
+      compType = 'for_sale';
+    } else if (ps.startsWith('price:')) {
       // Generic price with status hint — try to classify from status string in priceSource
-      const statusHint = priceSource.replace('price:', '').toLowerCase();
+      const statusHint = ps.replace('price:', '');
       if (statusHint.includes('sold') || statusHint.includes('recently_sold')) compType = 'sold';
       else if (statusHint.includes('pending') || statusHint.includes('contingent')) compType = 'pending';
       else if (statusHint.includes('for_sale') || statusHint.includes('active')) compType = 'for_sale';
